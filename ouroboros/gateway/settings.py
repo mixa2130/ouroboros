@@ -488,9 +488,10 @@ def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = Fal
         from ouroboros.config import DATA_DIR
 
         route = _active_main_route(settings)
+        compatible_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY") or "") or None
         ev = probe(DATA_DIR, provider=route["provider"], model=route["model"],
                    base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True,
-                   allow_generative=allow_generative)
+                   allow_generative=allow_generative, api_key=compatible_api_key)
         if confirms_at_least(ev, ONE_MILLION):
             return None
         win = int(ev.window_tokens or 0)

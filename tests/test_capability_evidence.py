@@ -177,7 +177,7 @@ def test_openai_compatible_metadata_window_fail_closed(monkeypatch):
 def test_provider_metadata_window_routes_openai_compatible(monkeypatch):
     seen = {}
 
-    def _fake(model, base_url, allow_fetch):
+    def _fake(model, base_url, allow_fetch, api_key=None):
         seen["hit"] = (model, base_url)
         return 4096
 
