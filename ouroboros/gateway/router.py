@@ -33,6 +33,7 @@ def collect_routes(
         api_skill_daemons,
         api_skill_delete,
         api_skill_grants,
+        api_owner_skill_attest_review,
         api_skill_lifecycle_queue,
         api_skill_reconcile,
         api_skill_review,
@@ -84,6 +85,7 @@ def collect_routes(
         api_reset,
         api_update_apply,
         api_update_check,
+        api_update_preflight,
         api_update_status,
     )
     from ouroboros.gateway.projects import (
@@ -146,6 +148,7 @@ def collect_routes(
         Route("/api/skills/daemons", endpoint=api_skill_daemons, methods=["GET"]),
         Route("/api/skills/lifecycle-queue", endpoint=api_skill_lifecycle_queue, methods=["GET"]),
         Route("/api/skills/{skill}/review", endpoint=api_skill_review, methods=["POST"]),
+        Route("/api/owner/skills/{skill}/attest-review", endpoint=api_owner_skill_attest_review, methods=["POST"]),
         Route("/api/skills/{skill}/grants", endpoint=api_skill_grants, methods=["POST"]),
         Route("/api/skills/{skill}/reconcile", endpoint=api_skill_reconcile, methods=["POST"]),
         Route("/api/marketplace/clawhub/search", endpoint=api_marketplace_search, methods=["GET"]),
@@ -206,6 +209,7 @@ def collect_routes(
         Route("/api/git/promote", endpoint=api_git_promote, methods=["POST"]),
         Route("/api/update/status", endpoint=api_update_status),
         Route("/api/update/check", endpoint=api_update_check, methods=["POST"]),
+        Route("/api/update/preflight", endpoint=api_update_preflight, methods=["POST"]),
         Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
         Route("/api/cost-breakdown", endpoint=make_cost_breakdown_endpoint(data_dir)),
         Route("/api/evolution-data", endpoint=api_evolution_data),

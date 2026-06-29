@@ -95,6 +95,8 @@ class ChatOutbound(TypedDict):
     accepted: NotRequired[bool]
     active_subagent_count: NotRequired[int]
     max_active_subagents: NotRequired[int]
+    queued_behind_active_cap: NotRequired[bool]
+    required_capabilities: NotRequired[list[str]]
     write_surface: NotRequired[str]
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
@@ -105,7 +107,9 @@ class ChatOutbound(TypedDict):
     status: NotRequired[str]
     cost_usd: NotRequired[float]
     result: NotRequired[str]
+    result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
+    trace_summary_truncated: NotRequired[bool]  # P3: WS preview capped
     error: NotRequired[str]
     artifact_status: NotRequired[str]
     artifact_bundle: NotRequired[Dict[str, Any]]
@@ -214,6 +218,17 @@ class ProjectsChangedOutbound(TypedDict):
     type: Literal["projects_changed"]
     project_id: NotRequired[str]
     chat_id: NotRequired[int]
+
+
+class TaskNamedOutbound(TypedDict):
+    """Outbound notice that the proactive card namer coined a project name for a fresh
+    main-chat task (v6.40). The client sets the live card's title to ``suggested_name``;
+    turn-into-project later reuses the same name. Not chat-scoped — carries only
+    ``task_id`` and is a no-op unless a thread already holds that card."""
+
+    type: Literal["task_named"]
+    task_id: str
+    suggested_name: str
 
 
 class ErrorResponse(TypedDict):
@@ -499,6 +514,7 @@ class TaskCreateRequest(_TaskCreateRequestRequired, total=False):
     attachments: list[Dict[str, Any]]
     allowed_resources: Dict[str, Any]
     resource_policy: Dict[str, Any]
+    disabled_tools: list[str]
     executor_ref: ExecutorRef
     service_teardown: Literal["stop", "keep"]
     deadline_at: str
@@ -562,6 +578,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/owner/context-mode",
     "POST /api/owner/scope-review-floor",
     "POST /api/owner/capability-ack",
+    "POST /api/owner/skills/{skill}/attest-review",
     "GET /api/model-catalog",
     "POST /api/tasks",
     "GET /api/tasks",
@@ -579,6 +596,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/git/promote",
     "GET /api/update/status",
     "POST /api/update/check",
+    "POST /api/update/preflight",
     "POST /api/update/apply",
     "GET /api/cost-breakdown",
     "GET /api/evolution-data",
@@ -648,6 +666,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "heartbeat",
     "extension_lifecycle",
     "projects_changed",
+    "task_named",
 )
 
 
@@ -665,6 +684,7 @@ __all__ = [
     "HeartbeatOutbound",
     "ExtensionLifecycleOutbound",
     "ProjectsChangedOutbound",
+    "TaskNamedOutbound",
     "ErrorResponse",
     "StatusResponse",
     "HealthResponse",

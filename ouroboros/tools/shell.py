@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 from hashlib import sha256
 import json
@@ -21,7 +20,7 @@ import uuid
 from typing import Any, Dict, List
 
 from ouroboros.artifacts import artifact_store_path_block_reason, copy_directory_to_task_artifacts, copy_file_to_task_artifacts
-from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, subprocess_new_group_kwargs
+from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
 from ouroboros.config import SETTINGS_DEFAULTS, get_runtime_mode, load_settings
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
@@ -30,7 +29,7 @@ from ouroboros.runtime_mode_policy import (
     protected_paths_in,
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
-from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, shell_argv_with_inline
+from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.tool_access import (
     active_tool_profile,
@@ -106,53 +105,91 @@ def kill_all_tracked_subprocesses():
         _active_subprocesses.clear()
 
 
+def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> "dict | None":
+    """For a command whose cwd is OUTSIDE the Ouroboros system repo (an external
+    workspace / target project, e.g. SWE-bench dig-direct ``/app``), return an
+    env copy with the repo dir scrubbed from ``PYTHONPATH`` so the target cannot
+    shadow-import Ouroboros's own modules (R2). ``ctx.repo_dir`` stays pinned to
+    the Ouroboros repo even in workspace mode, so this is the authoritative
+    in-repo test. Returns ``None`` for commands inside the system repo (Ouroboros
+    tooling legitimately imports itself) so they inherit ``os.environ``."""
+    try:
+        system_repo = pathlib.Path(getattr(ctx, "repo_dir")).resolve(strict=False)
+        wd = pathlib.Path(work_dir).resolve(strict=False)
+    except Exception:
+        return None
+    try:
+        in_repo = wd == system_repo or wd.is_relative_to(system_repo)
+    except AttributeError:  # pragma: no cover - py<3.9
+        in_repo = str(wd) == str(system_repo) or str(wd).startswith(str(system_repo) + os.sep)
+    if in_repo:
+        return None
+    return scrub_repo_from_pythonpath(dict(os.environ), system_repo)
+
+
 def _resolve_effective_timeout(
     default_timeout_sec: int,
     ctx: ToolContext | None = None,
     override_sec: int | None = None,
 ) -> int:
-    """Resolve effective timeout, capping by task deadline when present.
+    """Resolve the effective per-command timeout as ONE normalized pipeline:
+    resolve the REQUESTED value from a single precedence chain (per-call
+    ``override_sec`` > env ``OUROBOROS_TOOL_TIMEOUT_SEC`` > settings.json > config
+    ``SETTINGS_DEFAULTS`` > the in-code last-resort ``default_timeout_sec``), then
+    apply the per-call ceiling, then clamp toward the remaining task-deadline budget
+    (60s floor when a deadline exists), then floor at 1s. The outer budget loop
+    remains the hard deadline enforcer.
 
-    An explicit per-call ``override_sec`` (from ``run_command``/``run_script``)
-    takes precedence over env/settings/default, but is still clamped toward the
-    remaining task-deadline budget (same 60s floor / 1800s ceiling as the default
-    path); the outer budget loop remains the hard deadline enforcer.
+    Hygiene fix (SSOT): the prior code skipped an env/settings value EQUAL to the
+    config default (``!= default_setting``), so ``OUROBOROS_TOOL_TIMEOUT_SEC=600``
+    (= the SETTINGS_DEFAULTS value) silently fell through to the in-code 360s default.
+    The configured value is now honored regardless of equality, and env/settings
+    values no longer BYPASS the ceiling/deadline clamp. RELEASE NOTE: installs that
+    relied on the buggy effective 360s now get the configured 600s — a foreground
+    command may hold the task longer (still bounded by ceiling + task deadline).
     """
+    from ouroboros.config import get_per_call_timeout_ceiling_sec
+
+    # 1. Resolve the REQUESTED timeout from a single precedence chain.
+    requested: int | None = None
     if override_sec is not None:
         try:
             ov = int(override_sec)
         except (TypeError, ValueError):
             ov = 0
         if ov > 0:
-            from ouroboros.config import get_per_call_timeout_ceiling_sec
-
-            ceiling = get_per_call_timeout_ceiling_sec()
-            cap = ceiling
-            if ctx is not None:
-                remaining = deadline_remaining_sec(ctx)
-                if remaining > 0:
-                    cap = int(max(60, min(ceiling, remaining * 0.5)))
-            return max(1, min(ov, cap))
-    default_setting = int(SETTINGS_DEFAULTS.get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
-    raw = str(os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC", "") or "").strip()
-    if raw:
+            requested = ov
+    if requested is None:
+        raw = str(os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC", "") or "").strip()
+        if raw:
+            try:
+                v = int(raw)
+                if v > 0:
+                    requested = v
+            except ValueError:
+                pass
+    if requested is None:
         try:
-            parsed = int(raw)
-            if parsed > 0 and parsed != default_setting:
-                return parsed
-        except ValueError:
+            settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
+            if settings_val > 0:
+                requested = settings_val
+        except Exception:
             pass
-    try:
-        settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
-        if settings_val > 0 and settings_val != default_setting:
-            return settings_val
-    except Exception:
-        pass
+    if requested is None:
+        cfg_default = int(SETTINGS_DEFAULTS.get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
+        requested = cfg_default if cfg_default > 0 else int(default_timeout_sec)
+
+    # 2. Per-call ceiling.
+    effective = min(requested, get_per_call_timeout_ceiling_sec())
+
+    # 3. Clamp toward the remaining task-deadline budget (60s floor when a deadline exists).
     if ctx is not None:
         remaining = deadline_remaining_sec(ctx)
         if remaining > 0:
-            return int(max(60, min(1800, remaining * 0.5)))
-    return max(int(default_timeout_sec), 1)
+            effective = int(max(60, min(effective, remaining * 0.5)))
+
+    # 4. Floor at 1s.
+    return max(1, int(effective))
 
 
 def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = None) -> str:
@@ -192,7 +229,11 @@ def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: st
     roots.append((root_label, pathlib.Path(work_dir).resolve(strict=False)))
     profile = active_tool_profile(ctx)
     for label in ("task_drive", "artifact_store", "user_files"):
-        if not decide_tool_access(profile=profile, root=label, operation="read").allow:  # type: ignore[arg-type]
+        # An output is a deliverable the command PRODUCED, so its root must be WRITABLE by the
+        # profile — not merely readable. (v6.52.0: workspace_task gained user_files READ for
+        # attachments; that must NOT make user_files a valid run_command output destination.)
+        op = "write" if label == "user_files" else "read"
+        if not decide_tool_access(profile=profile, root=label, operation=op).allow:  # type: ignore[arg-type]
             continue
         try:
             root_path = resource_root_path(ctx, label)  # type: ignore[arg-type]
@@ -553,6 +594,45 @@ def _status_snapshot(repo_dir: pathlib.Path | None) -> list[str]:
     return sorted(_get_changed_files(repo_dir))
 
 
+def _shallow_listing(work_dir: pathlib.Path, cap: int = 5000) -> dict:
+    """Bounded immediate-children {name: (mtime_ns, size)} snapshot of a cwd. One
+    directory level, capped — NOT a recursive filesystem monitor (R5). Used to
+    detect a non-git user_files cwd actually producing a top-level deliverable."""
+    out: dict = {}
+    try:
+        with os.scandir(work_dir) as it:
+            for entry in it:
+                if len(out) >= cap:
+                    break
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    out[entry.name] = (int(st.st_mtime_ns), int(st.st_size))
+                except OSError:
+                    continue
+    except OSError:
+        return {}
+    return out
+
+
+def _user_files_run_had_effect(
+    before_changed: list[str],
+    after_changed: list[str],
+    before_listing: dict | None,
+    work_dir: pathlib.Path,
+) -> bool:
+    """Effect-based gate for the ARTIFACT_AUDIT_GAP nudge (R5): warn only when the
+    command produced an OBSERVABLE filesystem change in the cwd, not merely
+    because it ran in a user_files cwd. Git-tracked cwd (e.g. dig-direct /app) →
+    a status delta (modified or new untracked file). Non-git cwd → a bounded
+    shallow immediate-children snapshot delta. A read-only command (ls/cat/grep)
+    changes neither and is no longer falsely flagged."""
+    if after_changed != before_changed:
+        return True
+    if before_listing is not None:
+        return _shallow_listing(work_dir) != before_listing
+    return False
+
+
 def _protected_runtime_dirty_paths(repo_dir: pathlib.Path) -> list[str]:
     dirty: set[str] = set()
     for cmd in (["git", "diff", "--name-only"], ["git", "diff", "--cached", "--name-only"]):
@@ -902,21 +982,9 @@ def _run_shell(
     # Per-call timeout override (canonical timeout_sec; timeout accepted as alias).
     _timeout_override = timeout_sec if timeout_sec is not None else timeout
     if isinstance(cmd, str):
-        # Recover common stringified argv mistakes before failing.
-        recovered = None
-        try:
-            parsed = json.loads(cmd)
-            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                recovered = parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-        if recovered is None:
-            try:
-                parsed = ast.literal_eval(cmd)
-                if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                    recovered = parsed
-            except (ValueError, SyntaxError):
-                pass
+        # Recover common stringified argv mistakes before failing (shared SSOT with
+        # verify_and_record via shell_parse.recover_stringified_argv — P7 DRY / P2 class-fix).
+        recovered = recover_stringified_argv(cmd)
         # Malformed structured literals are not shell commands; refuse explicitly.
         if recovered is None:
             stripped = cmd.lstrip()
@@ -1038,6 +1106,14 @@ def _run_shell(
         return f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {cwd or work_dir}. allowed_roots: {roots}"
     repo_root = _resolve_git_root(pathlib.Path(work_dir))
     before_changed = _status_snapshot(repo_root)
+    # R5: for a non-git user_files cwd, take a bounded shallow snapshot so the
+    # artifact-audit nudge can be effect-based (only when the command actually
+    # produced a top-level deliverable), not fired on every read-only command.
+    before_listing = (
+        _shallow_listing(pathlib.Path(work_dir))
+        if (cwd_root == "user_files" and repo_root is None and not outputs)
+        else None
+    )
     before_outputs = _snapshot_declared_outputs(
         ctx,
         outputs,
@@ -1052,10 +1128,12 @@ def _run_shell(
         if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
             res = executor_execute(ctx, cmd, pathlib.Path(work_dir), timeout_sec)
         else:
+            run_env = _shell_env_for_cwd(ctx, pathlib.Path(work_dir))
             res = _tracked_subprocess_run(
                 cmd, cwd=str(work_dir),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=timeout_sec,
+                **({"env": run_env} if run_env is not None else {}),
             )
         if res.returncode != 0:
             executor_note = ""
@@ -1099,9 +1177,13 @@ def _run_shell(
             before_outputs=before_outputs,
         )
         audit_note = ""
-        if cwd_root == "user_files" and not outputs:
+        if (
+            cwd_root == "user_files"
+            and not outputs
+            and _user_files_run_had_effect(before_changed, after_changed, before_listing, pathlib.Path(work_dir))
+        ):
             audit_note = (
-                "\n\n⚠️ ARTIFACT_AUDIT_GAP: command ran in user_files cwd without "
+                "\n\n⚠️ ARTIFACT_AUDIT_GAP: command modified files in a user_files cwd without "
                 "outputs=[...]. If it created a deliverable, rerun/register the file "
                 "with outputs or write_file(root=artifact_store) before claiming it."
             )
@@ -1119,8 +1201,12 @@ def _run_shell(
         return autocorrect_note + f"{_describe_returncode(0, cwd=work_dir)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{executor_note}"
     except subprocess.TimeoutExpired:
         return (
-            f"⚠️ TOOL_TIMEOUT (run_command): command exceeded {timeout_sec}s. "
-            f"Subprocess tree was terminated. cwd={work_dir}"
+            f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
+            f"and its subprocess tree was terminated (cwd={work_dir}). NOTE: this is the per-command "
+            f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
+            f"sampling, large builds/downloads), start it with start_service and poll "
+            f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
+            f"(up to the per-call ceiling) — and preserve a best-effort deliverable before the task deadline."
         )
     except Exception as e:
         return f"⚠️ SHELL_ERROR: {e}. cwd={work_dir}"

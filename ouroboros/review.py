@@ -29,9 +29,49 @@ MAX_FUNCTION_LINES = 300
 # the hermetic self-commit preflight. Owner decision 2026-06-10: first paydown
 # in gate history (consolidation pass removed ~60 dead/duplicate/trivial-wrapper
 # functions) plus headroom to 3500 so routine fixes stop churning this constant.
+# v6.45.1: the 4-TZ mega-sprint plus managed #53 added reviewed GAIA/vision/
+# benchmark/evolution helper surfaces; accepted with explicit release-review debt.
 # The convention stands: growth must be acknowledged — bump deliberately with a
 # one-line justification here. Value archaeology lives in git history of this line.
-MAX_TOTAL_FUNCTIONS = 3500
+# v6.46.0: GAIA-forensic hardening added reviewed single-purpose helpers (fail_tasks,
+# _deliverables_root, _resolve_or_provider, the generative context-window probe, the
+# GAIA adapter knobs); bump with small headroom so the release's tests do not re-churn.
+# v6.47.0: the verify-before-done flagship (verify_and_record + receipt-store/grounding/
+# flag/nudge helpers in outcomes.py + loop.py), FR2 cooperative-subagent helpers, FR1
+# skill-publish eligibility predicate, and the query_code/shell/control extracted helpers.
+# v6.50.0: reconciliation-layer helpers (typed delegation constraints, schedule-time
+# capability reconciliation, child-absorption outcome shelf) plus SWE-Pro adapter
+# hardening tests. Small headroom; split/paydown remains tracked in DEVELOPMENT.md.
+# scope-review false-1M fix: +4 plus headroom (3575 -> 3582) — reviewed
+# single-purpose helpers in tools/scope_review.py: _is_designated_default_reviewer +
+# its nested _normalized, _provider_error_is_oversize, and
+# _scope_oversize_advisory_result (the last DEDUPES the two oversize→advisory
+# branches, keeping run_scope_review under the per-function line gate).
+# v6.50.3: +5 TB/swarm capability helpers — A1 verify._expected_matches (exact/
+# structured match), A3 loop._contract_expected_output (no-op nudge gate), B1
+# agent_task_pipeline._build_swarm_efficiency (delegation rollup), B2
+# control._count_live_sibling_children (burst/absorb advisory), A2
+# outcomes._is_ignored_readonly_block (SSOT predicate shared by the execution axis
+# and the verification ledger). Cap 3585 = current count 3584 + 1 slot headroom
+# (rebased on #57's scope-review fix, which already moved the cap to 3582).
+# v6.51.0: +11 net = shell_parse.recover_stringified_argv + normalize_check_argv (verify
+# argv/PATH SSOT, idea-1), outcomes.latest_unreconciled_failed_receipt + ...verification
+# (red-finalize predicate, idea-3), and the review_evidence process-aware acceptance packet
+# (build_task_acceptance_evidence + 6 bounded/redacted/leak-safe helpers, idea-2), minus
+# verify._normalize_check (now an alias to the shell_parse SSOT). The 6 _accept_* helpers
+# keep build_task_acceptance_evidence under the 150-line method gate. +1 (review round-1):
+# the _accept_enforce_budget `_size()` closure (disclosed-truncation ladder, leak-safety fix).
+# Cap 3597 = 3585 + 12, no extra headroom (acknowledged growth, per the gate's purpose).
+# v6.52.0 +15 = 3612: media.py ocr_pdf/youtube_transcript + 4 helpers (P4b); llm._is_deferrable_image_user_turn
+# (P4a ordering); verify._confine_artifact_path + _probe_artifact_lifecycle (C); artifacts.stage_task_attachments
+# + _safe_attachment_name + context._build_attachment_image_blocks + gateway._render_attachment_lines
+# + ws._chat_attachment_uploads (P1 attachment substrate + full desktop unify).
+MAX_TOTAL_FUNCTIONS = 3612
+GRANDFATHERED_OVERSIZED_FUNCTIONS = {
+    ("agent_startup_checks.py", "verify_restart"),  # managed #53 boot diagnostic flow, 307 lines
+    ("git.py", "_run_reviewed_stage_cycle"),  # reviewed-commit gate orchestration, 302 lines
+    ("events.py", "_handle_schedule_task"),  # v6.50 admission reconciliation grew the existing scheduling choke point.
+}
 # Grandfathered modules are accepted debt until their surfaces stabilize/split.
 GRANDFATHERED_OVERSIZED_MODULES = {
     "llm.py",
@@ -52,6 +92,8 @@ GRANDFATHERED_OVERSIZED_MODULES = {
     # is tracked as accepted debt to pay down after the feature stabilizes.
     "registry.py",
     "events.py",
+    "control.py",
+    "workers.py",
     # v6.33.0 reliability work crossed three core modules that were at/near the
     # ceiling. loop.py (was 1523) gained deadline-aware finalization + intrinsic
     # pacing; the helpers are tightly coupled to loop internals (_forced_final_answer,

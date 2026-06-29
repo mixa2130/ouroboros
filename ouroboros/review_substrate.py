@@ -17,7 +17,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List
 
-from ouroboros.config import get_review_models
+from ouroboros.config import adaptive_quorum, get_review_models
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.triad_review import extract_json_array
@@ -205,8 +205,8 @@ def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
     # "for whom we review" is auditable. Reviewer reasoning, not a new
     # authoritative gate (criteria live in actors[].parsed, not a separate phase).
     criteria_key = (
-        ', criteria_used (the acceptance criteria you re-derived from the goal and checked, '
-        "as a short list of strings)"
+        ', criteria_used (the acceptance criteria you re-derived from the full goal narrative '
+        'and checked, not only from explicit bullet points, as a short list of strings)'
         if request.surface == "task_acceptance"
         else ""
     )
@@ -221,9 +221,13 @@ def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
     )
     acceptance_rules = (
         "For TASK ACCEPTANCE: do not accept a 'solved' claim on assertion alone. Re-derive the "
-        "acceptance criteria from the goal/spec yourself, then require that the evidence contains "
-        "an EXECUTED check that MIRRORS what the real grader would run (the actual test/command "
-        "and its observed output) — not a narrative that it passes. "
+        "acceptance criteria from the FULL goal/spec narrative yourself (including prose context, "
+        "requirements implied outside bullet lists, and any named user-facing interface), enumerate "
+        "all affected components/surfaces you expect the deliverable to cover, then require "
+        "per-criterion evidence: an EXECUTED check that MIRRORS what the real grader would run "
+        "(the actual test/command and its observed output) — not a narrative that it passes. "
+        "If the evidence covers only part of the affected surface list, do not classify solved; "
+        "name the uncovered criteria/surfaces in findings or completion_coach. "
         "EVIDENCE INDEPENDENCE: a passing test is only credible if it is not graded by the "
         "agent's own hand. From the diff and tool trace, identify which test/check files the "
         "agent CREATED or MODIFIED this turn versus which were pre-existing or grader-owned; if "
@@ -236,6 +240,25 @@ def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
         "auto-evaluation, or provider/runtime fault is NOT itself an agent failure — judge "
         "whether the requested artifact/answer was produced before the environment terminated; "
         "do not FAIL a correct deliverable for an environment-imposed limit, note it as context. "
+        "METRIC-GROUNDED EVIDENCE: when the task states an explicit success metric, contains a "
+        "worked example, or warns that grading uses held-out cases, treat an existence-only "
+        "(artifact_observation) or substring-only verification receipt as INSUFFICIENT for solved — "
+        "require evidence that the metric/example is actually met (an exact/exact_line/json_equals "
+        "receipt, or the metric value in the check output). ANTI-CHEAT: credible verification uses "
+        "ONLY public task info (instruction text, embedded examples, installed oracles, the agent's "
+        "own independent checks); if the evidence came from reading a hidden /tests/ dir, "
+        "solution.sh, copied verifier code, or an online answer, treat the success claim as "
+        "UNVERIFIED. "
+        "PROCESS, NOT ONLY OUTCOME: the packet includes a `tool_trajectory` (HOW the task was "
+        "solved) and a first-class `verification_summary`. Audit the process — if the agent used "
+        "the wrong tool, went the wrong direction, ignored its OWN red verification "
+        "(`verification_summary.unreconciled_red`, or a RED `latest_status`), or the final claim "
+        "is not supported by the trajectory, say so: a deliverable that looks superficially "
+        "correct but was reached the wrong way, or that contradicts the agent's own checks, is at "
+        "most best_effort, and completion_coach must name the process fix. PROVENANCE: every "
+        "evidence block is tagged in `__provenance__` (host_attested / agent_supplied / "
+        "tool_result / artifact / hidden_or_restricted) — weigh host_attested over agent_supplied, "
+        "and NEVER credit a success claim to `hidden_or_restricted` evidence (a benchmark/test leak). "
         if request.surface == "task_acceptance"
         else ""
     )
@@ -426,6 +449,17 @@ class ReviewCoordinator:
         # FAIL still counts regardless of tier (conservative — never excuse a fail).
         classify_tier = bool((request.policy or {}).get("classify_outcome_tier"))
         _valid_tiers = {"solved", "best_effort", "blocked_with_evidence"}
+        # Advisory acceptance surface (task review) ONLY: review may UPGRADE but must
+        # not single-FAIL-veto a grounded answer, and a SOLVED PASS need not carry a
+        # tier-up coach. The blocking commit/scope immune gate (HARDNESS_HARD_GATE) is
+        # a SEPARATE path and stays fail-closed and unchanged (Bible P3). Keyed on the
+        # surface (the SSOT): EVERY task_acceptance review is advisory — both the
+        # host-forced loop path and the visible task_acceptance_review tool — while
+        # commit/scope use distinct surfaces, so this can never relax the immune gate.
+        is_advisory = (
+            request.surface == "task_acceptance"
+            or str((request.policy or {}).get("hardness") or "") == HARDNESS_ADVISORY_VISIBLE
+        )
         for actor in actors:
             if actor.status == "error":
                 actor_errors.append(f"{actor.slot_id}:{actor.error}")
@@ -438,10 +472,15 @@ class ReviewCoordinator:
             # The required-tier contract needs BOTH a valid outcome_tier AND a
             # non-empty completion_coach (both are required JSON keys); a PASS
             # missing either is non-responsive to the contract.
+            _tier = str(parsed.get("outcome_tier") or "").strip().lower() if isinstance(parsed, dict) else ""
             contract_ok = (
-                isinstance(parsed, dict)
-                and str(parsed.get("outcome_tier") or "").strip().lower() in _valid_tiers
-                and bool(str(parsed.get("completion_coach") or "").strip())
+                _tier in _valid_tiers
+                and (
+                    bool(str((parsed or {}).get("completion_coach") or "").strip())
+                    # Advisory carve-out: a SOLVED deliverable has no tier-up step, so an
+                    # empty coach must NOT demote it to DEGRADED.
+                    or (is_advisory and _tier == "solved")
+                )
             )
             if signal == "FAIL":
                 fail_count += 1
@@ -461,7 +500,12 @@ class ReviewCoordinator:
         min_successful = max(1, int((request.policy or {}).get("min_successful_slots") or 1))
         fail_closed_on_errors = bool((request.policy or {}).get("fail_closed_on_errors"))
         degraded_reasons = actor_errors + parse_degraded
-        if fail_count:
+        # Advisory acceptance: require a MAJORITY of FAILs to aggregate FAIL (so a
+        # single stochastic FAIL — especially likely when all 3 slots are the SAME
+        # model — cannot veto a grounded answer). The blocking gate keeps single-FAIL
+        # fail-closed (threshold 1).
+        fail_threshold = adaptive_quorum(len(slots)) if is_advisory else 1
+        if fail_count >= fail_threshold:
             aggregate = "FAIL"
         elif pass_count >= min_successful and not (fail_closed_on_errors and actor_errors):
             aggregate = "PASS"
@@ -556,6 +600,12 @@ class ReviewCoordinator:
                 "max_tokens": int(request.max_tokens or slot.max_tokens),
                 "temperature": request.temperature if request.temperature is not None else slot.temperature,
                 "no_proxy": bool(request.no_proxy),
+                # Bound the TRANSPORT read timeout to the slot's logical timeout so a stalled
+                # provider connection fails fast (and is retried / recorded as a timeout actor)
+                # instead of hanging on the 3600s default read — which left the slot thread
+                # blocked and the whole review process unable to exit. The outer queue/wait_for
+                # timeout governs the LOGIC; this governs the SOCKET.
+                "timeout": float(slot.timeout_sec) if slot.timeout_sec else None,
             }
             chat = getattr(self.llm, "chat", None)
             if callable(chat):

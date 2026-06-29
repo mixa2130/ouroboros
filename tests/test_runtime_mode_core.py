@@ -41,9 +41,11 @@ def test_settings_defaults_include_phase2_keys():
     assert SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert SETTINGS_DEFAULTS["OUROBOROS_SKILLS_REPO_PATH"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "google/gemini-3.5-flash"
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_CODE"] == "google/gemini-3.5-flash"
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACK"] == "anthropic/claude-sonnet-4.6"
+    # Heavy/Light default EMPTY -> fall back to Main (role-model, v6.39); only Main and
+    # the resilience Fallbacks chain carry a real default.
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "anthropic/claude-sonnet-4.6"
 
 
 def test_valid_runtime_modes_is_frozen_tuple():
@@ -180,9 +182,9 @@ def _onboarding_payload_with_runtime(mode: str | None = None, skills_path: str =
         "LOCAL_MODEL_CHAT_FORMAT": "",
         "LOCAL_ROUTING_MODE": "cloud",
         "OUROBOROS_MODEL": "anthropic/claude-opus-4.6",
-        "OUROBOROS_MODEL_CODE": "anthropic/claude-opus-4.6",
+        "OUROBOROS_MODEL_HEAVY": "anthropic/claude-opus-4.6",
         "OUROBOROS_MODEL_LIGHT": "anthropic/claude-sonnet-4.6",
-        "OUROBOROS_MODEL_FALLBACK": "anthropic/claude-sonnet-4.6",
+        "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
         "OUROBOROS_SKILLS_REPO_PATH": skills_path,
     }
     if mode is not None:
@@ -346,8 +348,8 @@ def test_skills_ui_reads_live_extension_state_fields():
     assert "review_gate?.executable_review" in src or "review_gate.executable_review" in src
     assert "executable_review" in src
     assert "skill.review_status === 'blockers' && !reviewReady(skill)" in src
-    assert "function statusBadge(status, gate = null)" in src
-    assert "statusBadge(skill.review_status, skill.review_gate)" in src
+    assert "function statusBadge(status, gate = null, profile = '')" in src
+    assert "statusBadge(skill.review_status, skill.review_gate, skill.review_profile)" in src
     assert "Open widgets" in src
     assert "retry_install" in src
     assert "Retry install" in src

@@ -460,6 +460,8 @@ def _active_main_route(
         base_url = str(settings.get("OPENAI_BASE_URL") or "")
     elif provider == "openai-compatible":
         base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
+    elif provider == "cloudru":
+        base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
     elif provider == "gigachat":
         base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
     # CW7 (v6.34.0): honour the USE_LOCAL_MAIN routing setting — a local-routed main
@@ -474,7 +476,7 @@ def _active_main_route(
     return {"provider": provider, "model": model, "base_url": base_url, "use_local": use_local}
 
 
-def _max_context_block(settings: Dict[str, Any]):
+def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = False):
     """Capability-Evidence gate for Max context mode (BIBLE P1/P3): Max requires the
     active main route to carry CONFIRMED/ASSERTED ≥1M evidence, else fail-closed.
     Returns None when Max is permitted, or a plain-language block payload dict:
@@ -487,7 +489,8 @@ def _max_context_block(settings: Dict[str, Any]):
 
         route = _active_main_route(settings)
         ev = probe(DATA_DIR, provider=route["provider"], model=route["model"],
-                   base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True)
+                   base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True,
+                   allow_generative=allow_generative)
         if confirms_at_least(ev, ONE_MILLION):
             return None
         win = int(ev.window_tokens or 0)
@@ -530,16 +533,23 @@ def _active_route_confirms_max(
     *,
     model: str = "",
     use_local: Optional[bool] = None,
+    allow_fetch: bool = False,
 ) -> bool:
     """CW2 (v6.34.0): does the active main route carry confirmed/asserted >=1M
-    Capability Evidence RIGHT NOW, read-only (allow_fetch=False — no network on the
-    task hot path)? The task/loop path consults this to fail max-mode compaction
-    CLOSED when the stored OUROBOROS_CONTEXT_MODE no longer matches the route (e.g.
-    set out-of-band on an unconfirmed route). ``model`` / ``use_local`` pin the probe
-    to the loop's ACTUAL active route (a task model override or a local main lane,
-    CW7) — local routes are probed for their local n_ctx, never skipped. Complements
-    the settings-save gate (checks at write time) and the reactive provider-overflow
-    fallback (recovers after a rejection). Fail-closed on any error."""
+    Capability Evidence RIGHT NOW? ``model`` / ``use_local`` pin the probe to the
+    loop's ACTUAL active route (a task model override or a local main lane, CW7) —
+    local routes are probed for their local n_ctx, never skipped. Complements the
+    settings-save gate (checks at write time) and the reactive provider-overflow
+    fallback (recovers after a rejection). Fail-closed on any error.
+
+    ``allow_fetch`` (v6.39, H): the read-only hot path passes False (no network).
+    The ONCE-PER-TASK start-of-loop gate passes True — a LAZY probe-on-first-use so
+    a genuine >=1M route is actually confirmed when CONTEXT_MODE=max is the default
+    and the owner never toggled Low->Max in the UI (the only path that previously
+    wrote evidence). The fetch is self-limiting: ``probe`` returns cached evidence
+    within its TTL (confirmed 24h / failed 10m) without refetching, and writes the
+    SHARED global DATA_DIR store, so concurrent subagents share one probe rather than
+    stampeding. Still fail-closed: an unconfirmed/sub-1M route never claims >=1M."""
     try:
         from ouroboros.capability_evidence import ONE_MILLION, confirms_at_least, probe
         from ouroboros.config import DATA_DIR
@@ -548,7 +558,7 @@ def _active_route_confirms_max(
         route = _active_main_route(s, model_override=model, use_local_override=use_local)
         ev = probe(
             DATA_DIR, provider=route["provider"], model=route["model"],
-            base_url=route["base_url"], use_local=route["use_local"], allow_fetch=False,
+            base_url=route["base_url"], use_local=route["use_local"], allow_fetch=allow_fetch,
         )
         return confirms_at_least(ev, ONE_MILLION)
     except Exception:
@@ -581,7 +591,7 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
     current = _owner_read_settings_raw()
     # Hard-block ENABLING max unless the active route's >=1M is confirmed/acked.
     if next_mode == "max" and previous_mode != "max":
-        block = _max_context_block(current)
+        block = _max_context_block(current, allow_generative=True)
         if block is not None:
             return JSONResponse({"ok": False, "context_mode": previous_mode, **block}, status_code=409)
     current["OUROBOROS_CONTEXT_MODE"] = next_mode
@@ -919,7 +929,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             except Exception:
                 _route_changed = True  # cannot compare routes -> assume changed, re-gate
             if _route_changed:
-                _block = _max_context_block(current)  # internally fail-closed on error
+                _block = _max_context_block(current, allow_generative=True)  # internally fail-closed on error
                 if _block is not None:
                     if _block.get("probe_failed"):
                         # Owner decision P4: a genuine NO-CONNECTION during the probe

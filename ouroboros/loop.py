@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import pathlib
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -13,7 +14,7 @@ import logging
 
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros.config import adaptive_quorum, get_context_mode, get_finalization_grace_sec, get_light_model, get_pacing_interval_sec, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import turn_has_reviewable_effects
+from ouroboros.outcomes import extract_final_answer, latest_unreconciled_failed_verification, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import initial_tool_schemas, list_non_core_tools
 from ouroboros.tools.registry import ToolRegistry
@@ -141,23 +142,6 @@ def _handle_text_response(
     return (content or ""), accumulated_usage, llm_trace
 
 
-def _final_text_acknowledges_incomplete_children(content: Any, children: List[Dict[str, Any]]) -> bool:
-    text = str(content or "").lower()
-    if not text.strip():
-        return False
-    incomplete_words = ("incomplete", "pending", "running", "scheduled", "not complete", "still")
-    if not any(word in text for word in incomplete_words):
-        return False
-    for child in children:
-        task_id = str(child.get("task_id") or child.get("id") or "").strip().lower()
-        status = str(child.get("status") or "").strip().lower()
-        if task_id and task_id not in text:
-            return False
-        if status and status not in text:
-            return False
-    return True
-
-
 def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
     names: List[str] = []
     for call in llm_trace.get("tool_calls") or []:
@@ -225,7 +209,7 @@ def _force_plan_completed(llm_trace: Dict[str, Any]) -> bool:
     Reads the structured ``plan_review_aggregate`` flag captured from the FULL
     tool result at execution time (loop_tool_execution); the old substring
     check against the 700-char trace preview could never see the aggregate
-    marker at the end of a long plan output, wedging Consilium tasks in the
+    marker at the end of a long plan output, wedging swarm tasks in the
     force-plan reminder loop.
     """
     for call in llm_trace.get("tool_calls") or []:
@@ -484,7 +468,9 @@ def _evict_stale_image_blocks(messages: List[Dict[str, Any]], *, incoming: int =
         if caption:
             placeholder += f": {caption}"
         if source_path:
-            placeholder += f"; re-view: vlm_query file_path={source_path}"
+            # view_image re-views the local file natively. VLM tools are vision/local-media
+            # tools, not _WEB_TOOLS; benchmark isolation withholds them by name.
+            placeholder += f"; re-view: view_image path={source_path}"
         placeholder += "]"
         content[b_idx] = {"type": "text", "text": placeholder}
 
@@ -572,6 +558,15 @@ def _run_task_acceptance_review_once(
     emit_progress: Callable[[str], None],
 ) -> bool:
     mode = get_task_review_mode()
+    # Answer-lock: latch the latest typed FINAL ANSWER from a finalizing round so a
+    # later round that drops the marker cannot erase it (see derive_loop_outcome).
+    _ans = extract_final_answer(content or "")
+    if _ans:
+        llm_trace["best_valid_final_answer"] = _ans
+        # Stamp the tool-call count: this latch is a safe fallback ONLY while no further
+        # grounding happens. If a later round does NEW tool work and then emits an
+        # unmarked answer, derive_loop_outcome must NOT resurrect this (now stale) value.
+        llm_trace["best_valid_final_answer_tools"] = len(llm_trace.get("tool_calls") or [])
     if getattr(tools._ctx, "_task_acceptance_reviewed", False):
         return False
     is_direct_chat = bool(getattr(tools._ctx, "is_direct_chat", False))
@@ -608,7 +603,7 @@ def _run_task_acceptance_review_once(
             run_review_request,
         )
 
-        from ouroboros.review_evidence import collect_turn_diff
+        from ouroboros.review_evidence import build_task_acceptance_evidence
 
         # A commit only "happened this turn" when it actually LANDED. A
         # REVIEW_BLOCKED / GIT_ERROR commit attempt is intentionally NOT a
@@ -622,13 +617,19 @@ def _run_task_acceptance_review_once(
             and str(c.get("status") or "") == "ok"
             for c in (llm_trace.get("tool_calls") or [])
         )
-        evidence = {
-            "task_id": task_id,
-            "task_type": task_type,
-            "tool_calls": llm_trace.get("tool_calls") or [],
-            "reasoning_notes": llm_trace.get("reasoning_notes") or [],
-            "repo_diff": collect_turn_diff(tools._ctx, include_recent_commit=committed_this_turn),
-        }
+        # v6.51.0 idea-2: process-aware evidence packet — full contract + first-class
+        # verification_summary (RED receipts surfaced; the authoritative evidence in
+        # dig-direct mode where repo_diff cannot capture the external /app target) +
+        # bounded/redacted tool-call trajectory + leak-safe artifacts + provenance tags,
+        # under a disclosed-truncation budget. The reviewer audits outcome AND process.
+        evidence = build_task_acceptance_evidence(
+            tools._ctx,
+            llm_trace=llm_trace,
+            drive_root=drive_root,
+            task_id=task_id,
+            task_type=task_type,
+            include_recent_commit=committed_this_turn,
+        )
         slots = reviewer_slots(effort=resolve_effort("review"), role_hint="task acceptance")
         min_successful = adaptive_quorum(len(slots))
         request = ReviewRequest(
@@ -704,6 +705,10 @@ def _run_task_acceptance_review_once(
         # a prior pass. Record THIS (final-deliverable) verdict and finalize so the
         # objective axis reflects the shipped answer, not a stale pre-revision one.
         tools._ctx._task_acceptance_reviewed = True
+        # Answer integrity is preserved monotonically by the best_valid_final_answer
+        # latch (set above + tool-count-stamped): a revise that DROPS the marker is
+        # recovered, while a deliberate post-review FINAL ANSWER marker (a genuine
+        # correction) is always respected. No pre-answer override of an explicit marker.
         if capsule:
             emit_progress(f"Task acceptance review: {result.aggregate_signal} (improvement note already fed back; finalizing).")
         else:
@@ -749,6 +754,58 @@ def _adopt_fallback_route(ctx: Any, fallback_model: str, fallback_use_local: boo
     return fallback_model, fallback_use_local
 
 
+def _run_cross_model_fallback_chain(
+    *, llm, ctx, tools, messages, active_model, active_use_local, tool_schemas,
+    active_effort, max_retries, drive_logs, task_id, round_idx, event_queue,
+    accumulated_usage, task_type, emit_progress,
+) -> tuple:
+    """F1 (v6.39): 429-aware cross-model fallback CHAIN. Mark the failed primary on
+    cooldown if its last failure was transient (so a swarm stops stampeding it), then walk
+    the configured fallback chain, skipping cooled-down models, until one responds. Each
+    candidate gets a small per-candidate attempt cap so a multi-model chain cannot multiply
+    into a long retry storm; every call stays deadline-aware. The bench (FALLBACKS==main)
+    dedupes to an empty chain -> no cross-model fallback, by design. Returns the new
+    ``(msg, active_model, active_use_local)``; ``msg`` is None if the whole (cooled-down /
+    empty) chain is exhausted, leaving the caller to join the provider-unavailable shelf."""
+    from ouroboros import fallback_cooldown as _fcd
+    from ouroboros.config import get_fallback_models
+    from ouroboros.loop_llm_call import _COOLDOWN_ERROR_KINDS as _cooldown_kinds
+
+    def _cooled(model: str, use_local: bool) -> None:
+        if str(accumulated_usage.get("_last_llm_error_kind") or "") in _cooldown_kinds:
+            _fcd.mark_cooldown(model, use_local)
+
+    _cooled(active_model, active_use_local)
+    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
+    attempt_cap = _fcd.attempts_per_model()
+    msg = None
+    for fallback_model in get_fallback_models(active_model):
+        if _fcd.is_cooling_down(fallback_model, fallback_use_local):
+            continue
+        deadline = _task_deadline_epoch(tools)
+        if deadline and time.time() >= deadline:
+            break
+        ptag = " (local)" if active_use_local else ""
+        ftag = " (local)" if fallback_use_local else ""
+        emit_progress(f"⚡ Fallback: {active_model}{ptag} → {fallback_model}{ftag}")
+        # Cross-FAMILY fallback must not replay the primary's provider-private reasoning to
+        # a different family (the GLM->Claude 400 "Invalid signature" death); the SSOT
+        # sanitizer is a no-op same-family.
+        fallback_messages = LLMClient.sanitize_reasoning_on_model_switch(messages, active_model, fallback_model)
+        msg, _cost = call_llm_with_retry(
+            llm, fallback_messages, fallback_model, tool_schemas, active_effort,
+            max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
+            use_local=fallback_use_local, deadline_ts=deadline, attempt_cap=attempt_cap,
+        )
+        if msg is not None:
+            active_model, active_use_local = _adopt_fallback_route(
+                ctx, fallback_model, fallback_use_local, messages, fallback_messages
+            )
+            break
+        _cooled(fallback_model, fallback_use_local)
+    return msg, active_model, active_use_local
+
+
 def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content: Any) -> str:
     """C3.4 pre-finalization child absorption: build the bounded subagent-handoff
     reminder when a finished child's status/result changed since the last refresh, or
@@ -772,6 +829,13 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
             root_task_id=str(metadata.get("root_task_id") or task_id),
             exclude_task_id=task_id,
         )
+        # D#7: a child the parent EXPLICITLY decided about (discard_child_result /
+        # cancel_task stamp parent_decision) is handled — drop it from the reminder so the
+        # signal is the structured decision, not a phrase parsed from the final text (P5).
+        children = [
+            child for child in children
+            if str(child.get("parent_decision") or "").strip().lower() not in ("discarded", "cancelled")
+        ]
         signature = "|".join(
             f"{child.get('task_id') or child.get('id')}:{child.get('status')}:{len(str(child.get('result') or ''))}"
             for child in children
@@ -781,8 +845,17 @@ def _compute_subagent_handoff(tools: Any, drive_root: Any, task_id: str, content
             child for child in children
             if str(child.get("status") or "").strip().lower() not in FINAL_STATUSES
         ]
-        needs_incomplete_ack = bool(nonterminal_children) and not _final_text_acknowledges_incomplete_children(content, nonterminal_children)
-        if children and signature and (signature != previous or needs_incomplete_ack):
+        # P5: the reminder is suppressed ONLY by structured signals — a child explicitly
+        # discarded/cancelled (already filtered out of `children` above) or absorbed (an
+        # unchanged signature — the agent has already seen this exact state). It is NOT
+        # suppressed by parsing the final PROSE for status words (a removed keyword gate
+        # that could silently orphan a child). The reminder fires once per CHANGE (a child
+        # appearing/progressing/completing re-surfaces it) rather than every round, so the
+        # agent is informed without an unbreakable loop; if the agent then finalizes with
+        # children still unhandled, the no-tool / forced finalization paths append a loud
+        # orphan note via _forced_orphan_note (P1 — never a silent loss).
+        _ = nonterminal_children  # (kept for readability; trigger is change-based)
+        if children and signature and signature != previous:
             tools._ctx._subagent_handoff_signature = signature
             _absorb_budget = 160_000 if str(get_context_mode()).lower() == "max" else 60_000
             return format_subagent_absorption_message(
@@ -912,6 +985,19 @@ def _maybe_inject_time_budget_milestone(
     elapsed = max(0.0, (now - created).total_seconds())
     remaining_clamped = max(0.0, remaining)
     deadline_text = deadline.isoformat().replace("+00:00", "Z")
+    # M4 deadline-flush: at the TIGHTEST milestone, explicitly prompt the agent to
+    # write/flush its best current deliverable and run ONE cheap verify_and_record
+    # before the hard cutoff, so a time-boxed task ends with a salvaged, grounded
+    # result instead of dying empty. Gated on deadline_at (this whole function is);
+    # it only adds a prompt — forced finalization is untouched.
+    flush_clause = (
+        " You are near the hard cutoff: WRITE your best current deliverable now "
+        "(write_file/edit_text) and run ONE cheap verify_and_record on it, so a "
+        "salvageable, grounded result is in place before the deadline. If the task "
+        "expects a short answer, ALSO end your response with a single line, exactly: "
+        "FINAL ANSWER: <answer> — so a salvageable answer is captured before the cutoff."
+        if selected_label == "10%" else ""
+    )
     _append_or_merge_user_message(
         messages,
         (
@@ -921,6 +1007,7 @@ def _maybe_inject_time_budget_milestone(
             "Use this as planning context, not as a command to stop. If a passing artifact "
             "or service already exists, prefer preserving and verifying it over speculative "
             "improvements. If not, focus on the shortest path to a verifiable result."
+            + flush_clause
         ),
     )
     _emit_checkpoint_event(event_queue, task_id, drive_logs, {
@@ -1064,6 +1151,10 @@ def seal_task_transcript(
 
     candidate = messages[seal_candidate_idx]
     plain_text = str(candidate.get("content", ""))
+    if not plain_text.strip():
+        # Anthropic 400s on cache_control attached to an empty text block; never seal
+        # an empty tool output as the cache anchor (turns the whole task unanswerable).
+        plain_text = "(no tool output)"
     candidate["content"] = [
         {
             "type": "text",
@@ -1316,6 +1407,11 @@ class _RoundLimitContext:
     # Drive root for durable salvage (latest_llm_response_text) on the provider-death
     # path; optional so existing positional construction stays valid.
     drive_root: Optional[pathlib.Path] = None
+    # STATUS/budget drive root + root task id for the forced-finalization orphan note:
+    # child results live under the parent BUDGET drive, NOT the (possibly forked)
+    # drive_root, so the orphan scan must use this — same root get_task_result uses.
+    status_drive_root: Optional[pathlib.Path] = None
+    root_task_id: str = ""
 
 
 def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -1420,6 +1516,174 @@ def _maybe_early_finalize(
     return _maybe_deadline_local_finalize(limit_ctx, tools)
 
 
+def _finalize_limit_ctx(ctx: "_RoundLimitContext", tools: Any) -> "_RoundLimitContext":
+    """Resolve the deadline + STATUS/budget drive root + root task id from the live
+    ToolContext onto an already-constructed round-limit context (child results live under
+    the parent BUDGET drive, not the forked drive_root). The dataclass itself bundles the
+    13 per-round fields (so no >8-param builder function is needed — DEVELOPMENT param
+    rule); this fills only the 3 ctx-derived fields. Returns the same (mutated) ctx."""
+    meta = getattr(tools._ctx, "task_metadata", {}) if isinstance(getattr(tools._ctx, "task_metadata", {}), dict) else {}
+    ctx.deadline_ts = _task_deadline_epoch(tools)
+    ctx.status_drive_root = pathlib.Path(
+        str(meta.get("budget_drive_root") or getattr(tools._ctx, "budget_drive_root", "") or "")
+        or (ctx.drive_root if ctx.drive_root is not None else pathlib.Path(ctx.drive_logs).parent)
+    )
+    ctx.root_task_id = str(meta.get("root_task_id") or ctx.task_id)
+    return ctx
+
+
+def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = True) -> str:
+    """A bounded note listing children the parent did NOT explicitly handle (discard/cancel),
+    appended to a finalization so paid child work is never SILENTLY orphaned (P1; P5 — no
+    prose parsing). On a FORCED finalization (deadline / provider death / finalize_now,
+    ``include_terminal=True``) the parent was cut off and may not have seen completions, so
+    RUNNING and COMPLETED-undecided children are both reported. On a NORMAL no-tool
+    finalization (``include_terminal=False``) the agent was reminded of every change
+    (including completions) before choosing to finalize, so only STILL-RUNNING undecided
+    children — genuinely orphaned by finalizing mid-flight — are reported. Never raises."""
+    try:
+        # Child results live under the parent BUDGET drive (status_drive_root), not the
+        # forked drive_root — use the same root get_task_result / _compute_subagent_handoff
+        # use, or a forked/nested finalization scans the wrong tree and omits the note.
+        status_root = ctx.status_drive_root or ctx.drive_root or pathlib.Path(ctx.drive_logs).parent
+        if status_root is None or not ctx.task_id:
+            return ""
+        from ouroboros.task_status import FINAL_STATUSES, find_child_tasks
+
+        children = find_child_tasks(
+            pathlib.Path(status_root),
+            parent_task_id=ctx.task_id,
+            root_task_id=str(ctx.root_task_id or ctx.task_id),
+            exclude_task_id=ctx.task_id,
+        )
+
+        def _undecided(c: Dict[str, Any]) -> bool:
+            if str(c.get("parent_decision") or "").strip().lower() in ("discarded", "cancelled"):
+                return False  # explicitly handled
+            if not include_terminal and str(c.get("status") or "").strip().lower() in FINAL_STATUSES:
+                return False  # completed children were already surfaced via the reminder
+            return True
+
+        undecided = [c for c in children if _undecided(c)]
+        if not undecided:
+            return ""
+
+        def _label(c: Dict[str, Any]) -> str:
+            tid = str(c.get("task_id") or c.get("id") or "?")
+            st = str(c.get("status") or "?").strip().lower()
+            return f"{tid} [{'running' if st not in FINAL_STATUSES else st}]"
+
+        listed = "; ".join(_label(c) for c in undecided[:10])
+        more = f" (+{len(undecided) - 10} more)" if len(undecided) > 10 else ""
+        lead = "finalized under a hard limit with" if include_terminal else "finalized with"
+        detail = (
+            "running ones may be incomplete, completed ones may be UNREAD"
+            if include_terminal else
+            "still-running children not absorbed or discarded"
+        )
+        return (
+            f"\n\n⚠️ NOTE: {lead} {len(undecided)} child task(s) not explicitly absorbed or "
+            f"discarded — {detail}: {listed}{more}. Inspect with get_task_result(<id>) / "
+            f"peek_task(<id>)."
+        )
+    except Exception:
+        return ""
+
+
+def _running_undecided_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
+    try:
+        status_root = ctx.status_drive_root or ctx.drive_root or pathlib.Path(ctx.drive_logs).parent
+        if status_root is None or not ctx.task_id:
+            return []
+        from ouroboros.task_results import STATUS_RUNNING
+        from ouroboros.task_status import FINAL_STATUSES, find_child_tasks
+
+        children = find_child_tasks(
+            pathlib.Path(status_root),
+            parent_task_id=ctx.task_id,
+            root_task_id=str(ctx.root_task_id or ctx.task_id),
+            exclude_task_id=ctx.task_id,
+        )
+        out: list[Dict[str, Any]] = []
+        for child in children:
+            if str(child.get("parent_decision") or "").strip().lower() in ("discarded", "cancelled"):
+                continue
+            status = str(child.get("status") or "").strip().lower()
+            if status in FINAL_STATUSES or status != STATUS_RUNNING:
+                continue
+            out.append(child)
+        return out
+    except Exception:
+        return []
+
+
+def _task_may_delegate(tools: ToolRegistry) -> bool:
+    try:
+        ctx = tools._ctx
+        contract = getattr(ctx, "task_contract", {}) if isinstance(getattr(ctx, "task_contract", {}), dict) else {}
+        metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+        if not contract and isinstance(metadata.get("task_contract"), dict):
+            contract = metadata.get("task_contract")
+        if not contract:
+            return False
+        budget = contract.get("delegation_budget") if isinstance(contract.get("delegation_budget"), dict) else {}
+        return bool(budget.get("may_delegate", True) or budget.get("may_fan_out", True))
+    except Exception:
+        return False
+
+
+def _maybe_enforce_child_absorption_gate(
+    tools: ToolRegistry,
+    limit_ctx: _RoundLimitContext,
+    content: Any,
+    messages: List[Dict[str, Any]],
+    emit_progress: Callable[[str], None],
+    llm_trace: Dict[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]] | str]:
+    if not _task_may_delegate(tools):
+        return None
+    undecided = _running_undecided_children(limit_ctx)
+    if not undecided:
+        return None
+    if not getattr(tools._ctx, "_child_absorption_reminded", False):
+        tools._ctx._child_absorption_reminded = True
+        if content and str(content).strip():
+            messages.append({"role": "assistant", "content": content})
+        listed = "; ".join(str(c.get("task_id") or c.get("id") or "?") for c in undecided[:10])
+        reminder = (
+            "[CHILD_ABSORPTION_REQUIRED]\n"
+            "You still have RUNNING child task(s) in this task tree: "
+            f"{listed}. Before a clean final answer, wait/inspect them with wait_task/get_task_result, "
+            "or make an explicit decision with cancel_task / discard_child_result. This is a "
+            "bounded reminder; ignoring it will finalize best_effort, not clean."
+        )
+        _append_or_merge_user_message(messages, reminder)
+        emit_progress("Child absorption reminder injected before final response.")
+        llm_trace["reasoning_notes"].append("Child absorption reminder injected before final response.")
+        return "continue"
+    text, usage, _discarded_trace = _forced_final_answer(
+        limit_ctx,
+        prompt=(
+            "[FINALIZE_WITH_UNABSORBED_CHILDREN]\n"
+            "You still have running child tasks and already received one child-absorption reminder. "
+            "Produce an honest best-effort final answer now; name unabsorbed children explicitly."
+        ),
+        fallback_text="⚠️ Finalized best-effort with unabsorbed running child tasks.",
+        reason_code="children_unabsorbed",
+    )
+    return text, usage, llm_trace
+
+
+def _no_tool_final_answer(content, limit_ctx, llm_trace, accumulated_usage):
+    """Finalize a no-tool turn, appending a loud orphan note for any STILL-RUNNING child
+    not absorbed/discarded (P1 — never a silent loss; P5 — discard_child_result is how the
+    agent suppresses it). Completed children were already surfaced via the handoff reminder."""
+    return _handle_text_response(
+        (content or "") + _forced_orphan_note(limit_ctx, include_terminal=False),
+        llm_trace, accumulated_usage,
+    )
+
+
 def _forced_final_answer(
     ctx: _RoundLimitContext,
     *,
@@ -1431,6 +1695,7 @@ def _forced_final_answer(
     reason code (the best_effort outcome gate reads it downstream)."""
     llm_trace: Dict[str, Any] = {}
     _append_or_merge_user_message(ctx.messages, prompt)
+    orphan_note = _forced_orphan_note(ctx)
     try:
         final_msg, _final_cost = call_llm_with_retry(
             ctx.llm, ctx.messages, ctx.active_model, None, ctx.active_effort,
@@ -1445,13 +1710,13 @@ def _forced_final_answer(
             # Typed fact for the best_effort outcome gate: a REAL model answer
             # was extracted (host fallback strings never set this).
             ctx.accumulated_usage["_best_effort_extracted"] = True
-            return extracted, ctx.accumulated_usage, llm_trace
-        return fallback_text, ctx.accumulated_usage, llm_trace
+            return extracted + orphan_note, ctx.accumulated_usage, llm_trace
+        return fallback_text + orphan_note, ctx.accumulated_usage, llm_trace
     except Exception:
         log.warning("Failed to get final response after %s", reason_code, exc_info=True)
         ctx.accumulated_usage["execution_status"] = "failed"
         ctx.accumulated_usage["reason_code"] = reason_code
-        return fallback_text, ctx.accumulated_usage, llm_trace
+        return fallback_text + orphan_note, ctx.accumulated_usage, llm_trace
 
 
 def _apply_runtime_overrides(
@@ -1473,7 +1738,7 @@ def _apply_runtime_overrides(
     return active_model, active_use_local, active_effort
 
 
-def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "") -> str:
+def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = "", *, allow_fetch: bool = False) -> str:
     """CW2 (v6.34.0): enforce the max-mode contract at the point of USE. Max is kept
     only when the ACTUAL active route — remote OR local (USE_LOCAL_MAIN, a local model,
     or a per-task switch_model override) — carries confirmed >=1M Capability Evidence
@@ -1486,7 +1751,7 @@ def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = ""
         return mode
     try:
         from ouroboros.gateway.settings import _active_route_confirms_max
-        if not _active_route_confirms_max(model=model, use_local=use_local):
+        if not _active_route_confirms_max(model=model, use_local=use_local, allow_fetch=allow_fetch):
             log.info(
                 "Max context mode is not confirmed >=1M for the active route "
                 "(use_local=%s); using low-mode compaction for this task (fail-closed, CW2).",
@@ -1514,6 +1779,183 @@ def _apply_overrides_and_regate_mode(ctx, active_model, active_use_local, active
     return active_model, active_use_local, active_effort, active_context_mode
 
 
+def _visible_round_text(content: Any) -> str:
+    """The round's visible assistant text as a plain string. A provider may return ``content`` as
+    a string OR a list of typed blocks; collect the ``text`` of every block EXCEPT reasoning ones
+    (Anthropic ``thinking``/``redacted_thinking``, Gemini ``part.thought``) — the exact complement
+    of extract_display_reasoning. A regular Gemini part carries ``text`` with NO ``type``, so keying
+    on the ABSENCE of a reasoning marker (not on ``type == 'text'``) avoids dropping real answer
+    text; a non-empty block list never stringifies to a raw Python repr, and a thinking-only list
+    correctly reads as 'no visible text' (letting narration fall back to readable reasoning)."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        out: List[str] = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if str(b.get("type") or "") in ("thinking", "reasoning", "redacted_thinking") or b.get("thought") is True:
+                continue  # reasoning/thinking blocks are display reasoning, not visible answer text
+            txt = b.get("text")
+            if isinstance(txt, str):
+                out.append(txt)
+        return "".join(out).strip()
+    return ""
+
+
+def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_trace: Dict[str, Any]) -> None:
+    """Emit the round's progress bubble: the visible assistant text, or — for a pure tool-call round
+    with no visible text — readable reasoning the provider already returned. The reasoning fallback
+    is DISPLAY-ONLY: emitted to the UI bubble but NOT recorded in ``reasoning_notes`` (which feeds
+    build_trace_summary / task summaries) and never appended to the transcript, so it cannot leak out
+    of the display path into the durable trace or back to a provider. Gated by OUROBOROS_REASONING_SUMMARY."""
+    visible_text = _visible_round_text(content)
+    if visible_text:
+        emit_progress(visible_text)
+        llm_trace["reasoning_notes"].append(visible_text)
+    elif str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
+        display_reasoning = LLMClient.extract_display_reasoning(msg)
+        if display_reasoning:
+            emit_progress(display_reasoning)
+
+
+def _maybe_inject_finalization_nudges(
+    tools: ToolRegistry, drive_root: Optional[pathlib.Path], task_id: str,
+    llm_trace: Dict[str, Any], content: Optional[str], messages: List[Dict[str, Any]],
+    emit_progress: Callable[[str], None],
+) -> bool:
+    """One-shot pre-finalization injections that each re-loop (return True): the skill
+    finalization reminder, then the FR3 verify-before-done nudge. Extracted from
+    run_llm_loop to keep it under the method size gate."""
+    if drive_root is None:
+        return False
+    finalization_msg = _skill_finalization_message(drive_root, llm_trace)
+    if finalization_msg and not getattr(tools._ctx, "_skill_finalization_injected", False):
+        tools._ctx._skill_finalization_injected = True
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{finalization_msg}")
+        emit_progress(finalization_msg)
+        llm_trace["reasoning_notes"].append(finalization_msg)
+        return True
+    if not getattr(tools._ctx, "_verify_red_nudged", False):
+        # Red-verification one-shot nudge: the agent's most recent host-attested verify
+        # receipt is RED and unreconciled — finalizing over your own failing check is a
+        # self-contradiction (Bible P3/P12), distinct from the receipt_absent case below
+        # (that is "no grounding"; this is "grounding says FAIL"). Ordered BEFORE the FR3
+        # verify nudge. Binary latch; advisory (the agent may still finalize with reasoning);
+        # forced-finalization paths return earlier and bypass it. Structural — keyed on the
+        # typed receipt status, never content (Bible P5). Benchmark-neutral wording.
+        _failed_receipt = latest_unreconciled_failed_verification(drive_root, task_id)
+        if _failed_receipt is not None:
+            tools._ctx._verify_red_nudged = True
+            _check = str(_failed_receipt.get("check") or "").strip()
+            _rc = _failed_receipt.get("returncode")
+            _on = f" on `{_check}`" if _check else ""
+            _exit = f" (exit {_rc})" if _rc is not None else ""
+            if content and content.strip():
+                messages.append({"role": "assistant", "content": content})
+            _append_or_merge_user_message(
+                messages,
+                "[SYSTEM REMINDER]\nYour latest host-attested verification is RED" + _on + _exit +
+                ". Before a clean final answer, reconcile it: re-check it, explain why this check is "
+                "not the task's acceptance contract, or fix and re-run verification. This is advisory — "
+                "if you finalize anyway, make the residual risk explicit.",
+            )
+            emit_progress("Red-verification nudge injected before final response.")
+            llm_trace["reasoning_notes"].append("Red-verification nudge injected before final response.")
+            return True
+    if not getattr(tools._ctx, "_verify_nudged", False) and should_nudge_verification(llm_trace, drive_root, task_id):
+        # FR3 one-shot verify-before-done nudge: real effects, no host-attested grounding
+        # yet. Binary latch (not a tunable counter), sibling BEFORE the acceptance-review
+        # gate so it reaches both required and auto. Forced finalization paths return
+        # earlier and bypass it (they land best_effort).
+        tools._ctx._verify_nudged = True
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM REMINDER]\nBefore finalizing: you produced a real deliverable but recorded no "
+            "machine verification. Call verify_and_record — run your test/command (explicit_command/"
+            "explicit_metric/visible_verifier), confirm the artifact exists (artifact_observation), or "
+            "honestly declare no_visible_machine_contract — so the result is grounded, then continue.",
+        )
+        emit_progress("Verify-before-done nudge injected before final response.")
+        llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
+        return True
+    # A3 one-shot no-op nudge: a declared deliverable (non-empty expected_output) but the
+    # turn made NO tool calls, produced NO reviewable effects, and carries NO FINAL ANSWER
+    # marker — a structural about-to-finalize-without-attempting signal (same condition
+    # family as the M2 expected_output_ungrounded flag). Own latch, ordered AFTER the verify
+    # nudge; never forces acceptance review; forced-finalization paths return earlier and
+    # bypass it. Structural facts only (no refusal-text matching).
+    if (
+        not getattr(tools._ctx, "_noop_attempt_nudged", False)
+        and str(_contract_expected_output(tools._ctx)).strip()
+        and not (llm_trace.get("tool_calls") or [])
+        and not turn_has_reviewable_effects(llm_trace)
+        and not extract_final_answer(content or "")
+    ):
+        tools._ctx._noop_attempt_nudged = True
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM REMINDER]\nThis task declares an expected output, but you are about to finalize "
+            "without having attempted it — no tool calls, no reviewable effects, no FINAL ANSWER. "
+            "Actually attempt the task now (do the work / produce the deliverable / derive the answer), "
+            "then finalize. If it is genuinely blocked, say so with the concrete blocker and evidence.",
+        )
+        emit_progress("No-op attempt nudge injected before final response.")
+        llm_trace["reasoning_notes"].append("No-op attempt nudge injected before final response.")
+        return True
+    # P2 one-shot final-answer-marker nudge: the turn produced REAL work (tool calls or
+    # reviewable effects) AND visible prose, but carries NO FINAL ANSWER marker — so the
+    # typed extractor would drop it and a forced/deadline finalization would score empty
+    # even though the answer is sitting in the prose. We strengthen the BEHAVIOR (ask the
+    # agent to mark its OWN answer) rather than mining prose into a claimed answer (Bible P5;
+    # codex-confirmed that prose-mining in core would harm ordinary users). Own latch,
+    # ordered AFTER verify/red/A3 (verification grounding outranks formatting); mutually
+    # exclusive with the A3 no-op nudge (which is the no-work case). Forced-finalization
+    # paths return earlier and bypass it. Structural facts only (no content matching).
+    if (
+        not getattr(tools._ctx, "_final_marker_nudged", False)
+        and content and content.strip()
+        and str(_contract_expected_output(tools._ctx)).strip()
+        and not extract_final_answer(content or "")
+        and ((llm_trace.get("tool_calls") or []) or turn_has_reviewable_effects(llm_trace))
+    ):
+        tools._ctx._final_marker_nudged = True
+        messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM REMINDER]\nYou have done the work but have not marked a final answer. If you "
+            "are done, end your response with a single line, exactly: FINAL ANSWER: <answer> — the "
+            "bare deliverable only (a number / a few words / a short list), so it is captured even if "
+            "the run is cut short. If you are not done, keep working.",
+        )
+        emit_progress("Final-answer marker nudge injected before final response.")
+        llm_trace["reasoning_notes"].append("Final-answer marker nudge injected before final response.")
+        return True
+    return False
+
+
+def _contract_expected_output(ctx: Any) -> str:
+    """Read the declared expected_output (as carried on the task contract/metadata for the
+    running ctx — the same declared field the M2 ungrounded flag keys on), for the A3 no-op nudge gate."""
+    contract = getattr(ctx, "task_contract", {})
+    if isinstance(contract, dict) and str(contract.get("expected_output") or "").strip():
+        return str(contract.get("expected_output") or "")
+    metadata = getattr(ctx, "task_metadata", {})
+    if isinstance(metadata, dict):
+        if str(metadata.get("expected_output") or "").strip():
+            return str(metadata.get("expected_output") or "")
+        meta_contract = metadata.get("task_contract")
+        if isinstance(meta_contract, dict):
+            return str(meta_contract.get("expected_output") or "")
+    return ""
+
+
 def run_llm_loop(
     messages: List[Dict[str, Any]],
     tools: ToolRegistry,
@@ -1538,7 +1980,34 @@ def run_llm_loop(
     else:
         active_use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
     # CW2: max-mode enforced at point-of-USE — fail-closed to low if the active route (incl. local n_ctx) no longer confirms >=1M (not just at settings-save); low-mode also compacts sooner.
-    active_context_mode = _maybe_downgrade_max_unconfirmed(get_context_mode(), active_use_local, active_model)
+    # H (v6.39): the start-of-loop gate does a LAZY probe-on-first-use (allow_fetch=True,
+    # once per task) so a genuine >=1M route is actually confirmed even when max is the
+    # default and the owner never toggled Low->Max; the per-round re-gate stays read-only.
+    # Single-flight: ONLY a root/non-subagent task fires the network probe — subagents
+    # stay read-only and share the parent's warm global Capability-Evidence store, so a
+    # swarm cannot stampede the route's /models endpoint (the root probes first).
+    _ctx_meta = getattr(ctx, "task_metadata", {})
+    _is_subagent = (
+        isinstance(_ctx_meta, dict)
+        and str(_ctx_meta.get("delegation_role") or "").strip().lower() == "subagent"
+    )
+    _preferred_context_mode = get_context_mode()
+    active_context_mode = _maybe_downgrade_max_unconfirmed(
+        _preferred_context_mode, active_use_local, active_model, allow_fetch=not _is_subagent,
+    )
+    if _preferred_context_mode == "max" and active_context_mode != "max":
+        # Observable effective-vs-preferred: the downgrade is no longer a silent log
+        # line. Keep type=task_checkpoint (+ checkpoint_kind) so it is BOTH broadcast
+        # live AND durably persisted to events.jsonl (the durable append is gated on
+        # type==task_checkpoint), matching every other checkpoint emitter.
+        _emit_checkpoint_event(event_queue, task_id, drive_logs, {
+            "checkpoint_kind": "context_mode_downgraded",
+            "preferred_mode": _preferred_context_mode,
+            "effective_mode": active_context_mode,
+            "model": active_model,
+            "use_local": active_use_local,
+            "reason": "route_unconfirmed_ge_1m",
+        })
 
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
@@ -1586,11 +2055,11 @@ def run_llm_loop(
             # One forced-wrap-up context per round: consumed by the round-limit
             # path and the supervisor finalize_now control path below.
             limit_ctx = _RoundLimitContext(
-                messages, llm, active_model, active_effort, max_retries,
-                drive_logs, task_id, round_idx, event_queue,
-                accumulated_usage, task_type, active_use_local, MAX_ROUNDS,
-                deadline_ts=_task_deadline_epoch(tools), drive_root=drive_root,
+                messages, llm, active_model, active_effort, max_retries, drive_logs,
+                task_id, round_idx, event_queue, accumulated_usage, task_type,
+                active_use_local, MAX_ROUNDS, drive_root=drive_root,
             )
+            _finalize_limit_ctx(limit_ctx, tools)
             if round_idx > MAX_ROUNDS:
                 text, accumulated_usage, _ = _handle_round_limit(limit_ctx)
                 return text, accumulated_usage, llm_trace
@@ -1652,35 +2121,12 @@ def run_llm_loop(
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 
             if msg is None:
-                fallback_model = os.environ.get("OUROBOROS_MODEL_FALLBACK", "").strip()
-                if fallback_model and fallback_model != active_model:
-                    # Existing real-user cross-model resilience (the bench disables
-                    # it via fallback==main); try it before best-effort salvage.
-                    fallback_use_local = os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1")
-                    primary_tag = " (local)" if active_use_local else ""
-                    fallback_tag = " (local)" if fallback_use_local else ""
-                    emit_progress(f"⚡ Fallback: {active_model}{primary_tag} → {fallback_model}{fallback_tag} after empty response")
-                    # Cross-FAMILY fallback must not replay the primary model's
-                    # provider-private reasoning/thinking blocks to a different
-                    # family — that is the GLM->Claude 400 "Invalid signature in
-                    # thinking block" death. SSOT sanitizer returns the canonical
-                    # list unchanged on a same-family switch, a sanitized copy
-                    # otherwise; call_llm_with_retry only reads, so the canonical
-                    # `messages` keeps accumulating the fallback's response below.
-                    fallback_messages = LLMClient.sanitize_reasoning_on_model_switch(
-                        messages, active_model, fallback_model
-                    )
-                    msg, fallback_cost = call_llm_with_retry(
-                        llm, fallback_messages, fallback_model, tool_schemas, active_effort,
-                        max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
-                        use_local=fallback_use_local,
-                        deadline_ts=_task_deadline_epoch(tools),
-                    )
-                    if msg is not None:
-                        active_model, active_use_local = _adopt_fallback_route(
-                            ctx, fallback_model, fallback_use_local, messages, fallback_messages
-                        )
-
+                msg, active_model, active_use_local = _run_cross_model_fallback_chain(
+                    llm=llm, ctx=ctx, tools=tools, messages=messages, active_model=active_model,
+                    active_use_local=active_use_local, tool_schemas=tool_schemas, active_effort=active_effort,
+                    max_retries=max_retries, drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
+                    event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
+                    emit_progress=emit_progress)
                 if msg is None:
                     # Provider-death: join the unified honest best-effort shelf
                     # (deadline/budget/round-limit) instead of discarding useful
@@ -1695,9 +2141,9 @@ def run_llm_loop(
                     attempts = int(getattr(tools._ctx, "_force_plan_reminder_count", 0) or 0)
                     if attempts >= 2:
                         accumulated_usage["execution_status"] = "failed"
-                        accumulated_usage["reason_code"] = "consilium_force_plan_not_called"
+                        accumulated_usage["reason_code"] = "swarm_force_plan_not_called"
                         return (
-                            "⚠️ CONSILIUM_FORCE_PLAN_BLOCKED: plan_task was required for this Consilium task but was not called.",
+                            "⚠️ SWARM_INITIATIVE_BLOCKED: plan_task was required for this swarm task but was not called.",
                             accumulated_usage,
                             llm_trace,
                         )
@@ -1706,11 +2152,11 @@ def run_llm_loop(
                         messages.append({"role": "assistant", "content": content})
                     _append_or_merge_user_message(
                         messages,
-                        "[CONSILIUM_FORCE_PLAN] plan_task is required before finalizing this task. "
+                        "[SWARM_INITIATIVE] plan_task is required before finalizing this task. "
                         "Call plan_task now with an appropriate context_level, then continue.",
                     )
-                    emit_progress("Consilium force-plan reminder injected before final response.")
-                    llm_trace["reasoning_notes"].append("Consilium force-plan reminder injected before final response.")
+                    emit_progress("Swarm force-plan reminder injected before final response.")
+                    llm_trace["reasoning_notes"].append("Swarm force-plan reminder injected before final response.")
                     continue
                 handoff_msg = _compute_subagent_handoff(tools, drive_root, task_id, content)
                 if handoff_msg:
@@ -1720,14 +2166,13 @@ def run_llm_loop(
                     emit_progress("Subagent handoff status refreshed before final response.")
                     llm_trace["reasoning_notes"].append("Subagent handoff status refreshed before final response.")
                     continue
-                finalization_msg = _skill_finalization_message(drive_root, llm_trace) if drive_root is not None else ""
-                if finalization_msg and not getattr(tools._ctx, "_skill_finalization_injected", False):
-                    tools._ctx._skill_finalization_injected = True
-                    if content and content.strip():
-                        messages.append({"role": "assistant", "content": content})
-                    _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{finalization_msg}")
-                    emit_progress(finalization_msg)
-                    llm_trace["reasoning_notes"].append(finalization_msg)
+                if (absorption_result := _maybe_enforce_child_absorption_gate(tools, limit_ctx, content, messages, emit_progress, llm_trace)) == "continue":
+                    continue
+                if absorption_result is not None:
+                    return absorption_result
+                if _maybe_inject_finalization_nudges(
+                    tools, drive_root, task_id, llm_trace, content, messages, emit_progress
+                ):
                     continue
                 if _run_task_acceptance_review_once(
                     tools=tools,
@@ -1740,7 +2185,7 @@ def run_llm_loop(
                     emit_progress=emit_progress,
                 ):
                     continue
-                return _handle_text_response(content, llm_trace, accumulated_usage)
+                return _no_tool_final_answer(content, limit_ctx, llm_trace, accumulated_usage)
 
             if getattr(tools._ctx, "_skill_finalization_injected", False):
                 tools._ctx._skill_finalization_injected = False
@@ -1748,10 +2193,7 @@ def run_llm_loop(
             assistant_msg.setdefault("role", "assistant")
             messages.append(assistant_msg)
 
-            progress_text = str(content or "").strip()
-            if progress_text:
-                emit_progress(progress_text.strip())
-                llm_trace["reasoning_notes"].append(progress_text.strip())
+            _emit_round_progress(content, msg, emit_progress, llm_trace)
 
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,

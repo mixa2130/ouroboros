@@ -12,7 +12,6 @@ SYSTEM + BIBLE are tier-0 and always full.
 
 import os
 import pathlib
-import re
 import tempfile
 
 # Unique sentinel placed inside the ARCHITECTURE body so we can prove the full
@@ -205,8 +204,46 @@ def test_low_mode_development_full_for_direct_chat_tasks_unless_explicitly_disab
     assert "DEVELOPMENT.md" in pure_chat_text  # but named in the on-demand pointer
 
 
-def test_version_regexes_match_runtime_formats():
-    badge = '[![Version 5.5.0](https://img.shields.io/badge/version-5.5.0-green.svg)](VERSION)'
-    assert re.search(r'version[- ](\d+\.\d+\.\d+)', badge, re.IGNORECASE)
-    header = '# Ouroboros v5.5.0 — Architecture & Reference'
-    assert re.search(r'# Ouroboros v(\d+\.\d+\.\d+)', header)
+# --- H (v6.39): lazy probe-on-first-use threads allow_fetch (fail-closed) ---
+
+def test_maybe_downgrade_threads_allow_fetch_and_stays_max_when_confirmed():
+    from unittest.mock import patch
+    import ouroboros.gateway.settings as settings_mod
+    from ouroboros.loop import _maybe_downgrade_max_unconfirmed
+
+    seen = {}
+
+    def _fake_confirms(*, model="", use_local=None, allow_fetch=False, **kw):
+        seen["allow_fetch"] = allow_fetch
+        return True  # route confirms >=1M
+
+    with patch.object(settings_mod, "_active_route_confirms_max", _fake_confirms):
+        out = _maybe_downgrade_max_unconfirmed("max", False, "z-ai/glm-5.2", allow_fetch=True)
+    assert out == "max"  # confirmed -> stays max (lazy probe succeeded)
+    assert seen["allow_fetch"] is True  # allow_fetch threaded through
+
+    # unconfirmed route -> fail-closed to low, even with allow_fetch=True
+    with patch.object(settings_mod, "_active_route_confirms_max",
+                      lambda **kw: False):
+        assert _maybe_downgrade_max_unconfirmed("max", False, "m", allow_fetch=True) == "low"
+
+
+def test_effective_context_mode_fetches_for_root_not_subagent(monkeypatch):
+    from unittest.mock import patch
+    import ouroboros.loop as loop_mod
+    import ouroboros.context as context_mod
+
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
+    captured = []
+
+    def _fake_downgrade(mode, use_local, model="", *, allow_fetch=False):
+        captured.append(allow_fetch)
+        return mode
+
+    with patch.object(loop_mod, "_maybe_downgrade_max_unconfirmed", _fake_downgrade):
+        # root task -> lazy network probe (allow_fetch=True)
+        context_mod.effective_context_mode({"model": "z-ai/glm-5.2"})
+        # subagent -> read-only (allow_fetch=False), shares parent's warm store
+        context_mod.effective_context_mode({"model": "z-ai/glm-5.2", "delegation_role": "subagent"})
+
+    assert captured == [True, False]

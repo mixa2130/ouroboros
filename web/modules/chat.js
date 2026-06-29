@@ -4,6 +4,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
 import {
+    compactModel,
     getLogTaskGroupId,
     isGroupedTaskEvent,
     normalizeLogTs,
@@ -13,7 +14,6 @@ import {
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const CHAT_SESSION_ID_KEY = 'ouro_chat_session_id';
-const PLAN_PREFIX = 'Please do multi-model planning (plan_task tool) and web-search before answering or starting this task:\n\n';
 const MAX_PENDING_ATTACHMENTS = 10;
 const MAX_ATTACHMENT_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_PENDING_ATTACHMENT_BYTES = 100 * 1024 * 1024;
@@ -116,7 +116,7 @@ export function createChatInstance({
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-consilium" id="chat-consilium" type="button" data-armed="false" title="Consilium: arm a one-shot multi-subagent brainstorm/plan (plan_task + web search) for your next message. Auto-disarms after sending.">Consilium</button>
+                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: arm a one-shot deep plan + multi-subagent fan-out (plan_task + web search, then delegate) for your next message. Auto-disarms after sending.">Swarm</button>
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Applies on the next task.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
@@ -343,6 +343,10 @@ export function createChatInstance({
     let historySyncPromise = null;
     let welcomeShown = false;
     const liveCardRecords = new Map();
+    // Cluster B: a proactively-coined name (task_named) can arrive BEFORE the card's
+    // liveCardRecords entry exists (the namer broadcasts as the task starts). Buffer it
+    // here so createLiveCardRecord can apply it when the card appears (no lost title).
+    const pendingSuggestedNames = new Map();
     const taskUiStates = new Map();
     // Finished task ids hidden from routine syncs until reload/reconnect rebuilds history.
     const retiredTaskIds = new Set();
@@ -891,6 +895,9 @@ export function createChatInstance({
             // used to name a project on "turn into project" when the server has no
             // title/objective yet (P1, direct-chat conversion). One-shot handoff.
             objectiveHint: (isMain && !options.isSubagent) ? _pendingCardObjective : '',
+            // Cluster B: the proactively-coined LLM project name; when set it becomes
+            // the card title (the activity headline keeps rendering in the lines below).
+            suggestedName: '',
         };
         if (isMain && !options.isSubagent) _pendingCardObjective = '';
         record.summaryButtonEl?.addEventListener('click', () => {
@@ -905,12 +912,29 @@ export function createChatInstance({
             if (!button) return;
             const lineKey = button.dataset.liveLineToggle || '';
             if (!lineKey) return;
-            if (record.expandedLineKeys.has(lineKey)) record.expandedLineKeys.delete(lineKey);
-            else record.expandedLineKeys.add(lineKey);
+            const nowExpanded = !record.expandedLineKeys.has(lineKey);
+            if (nowExpanded) record.expandedLineKeys.add(lineKey);
+            else record.expandedLineKeys.delete(lineKey);
             renderLiveCardTimeline(record);
             syncLiveCardLayout(record);
+            // P3: on expand, lazily fetch the genuinely-full output for a server-truncated
+            // line (the WS preview was capped at 4000); cached on the item so a re-render
+            // keeps it. Best-effort — the capped preview stays on failure.
+            if (nowExpanded) {
+                const item = record.items.find((it) => it.lineKey === lineKey);
+                if (item && item.truncated && item.fullRef && !item.fetchedFull && !item._fetchingFull) {
+                    fetchFullLineOutput(item, record);
+                }
+            }
         });
         liveCardRecords.set(normalizedGroupId, record);
+        // Cluster B: apply a name that arrived (task_named) before this card existed.
+        const _pendingName = pendingSuggestedNames.get(normalizedGroupId);
+        if (_pendingName && !record.isSubagent) {
+            pendingSuggestedNames.delete(normalizedGroupId);
+            record.suggestedName = _pendingName;
+            if (record.titleEl) record.titleEl.textContent = _pendingName;
+        }
         resetLiveCardRecord(record);
         return record;
     }
@@ -918,6 +942,25 @@ export function createChatInstance({
     function getLiveCardRecord(groupId = '') {
         const normalizedGroupId = groupId || activeLiveGroupId || 'chat';
         return liveCardRecords.get(normalizedGroupId) || createLiveCardRecord(normalizedGroupId);
+    }
+
+    // Cluster B: apply the proactively-coined project name to a main card already on
+    // screen (live `task_named` event or history replay). A main card's groupId IS its
+    // task_id, so the lookup is direct. No-op until the card exists / without a name.
+    function applySuggestedName(taskId, name) {
+        const tid = String(taskId || '').trim();
+        const nm = String(name || '').trim();
+        if (!tid || !nm) return;
+        const record = liveCardRecords.get(tid);
+        if (!record) {
+            // Card not created yet (the namer raced ahead of the first progress event).
+            // Buffer so createLiveCardRecord applies it when the card appears.
+            pendingSuggestedNames.set(tid, nm);
+            return;
+        }
+        if (record.isSubagent) return;
+        record.suggestedName = nm;
+        if (record.titleEl) record.titleEl.textContent = nm;
     }
 
     function ensureSubagentContainer(parentId = '') {
@@ -1029,6 +1072,9 @@ export function createChatInstance({
         return Boolean(
             (item.fullHeadline && item.fullHeadline !== item.headline)
             || (item.fullBody && item.fullBody !== item.body)
+            // P3: even when the preview equals the capped body, a server-truncated line
+            // with a fetch ref has MORE to show (the genuinely-full output on demand).
+            || (item.truncated && item.fullRef)
         );
     }
 
@@ -1096,7 +1142,12 @@ export function createChatInstance({
         const expandable = isLiveLineExpandable(item);
         const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
         const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;
-        const displayBody = expanded && item.fullBody ? item.fullBody : item.body;
+        // P3: when expanded, prefer the genuinely-full fetched output, then the capped
+        // fullBody, then the preview body. A server-truncated line shows the fetched full
+        // text in a bounded-scroll box so a huge research output never grows the chat.
+        const displayBody = expanded ? (item.fetchedFull || item.fullBody || item.body) : item.body;
+        const showingFetched = expanded && Boolean(item.fetchedFull);
+        const loadingFull = expanded && Boolean(item.truncated && item.fullRef && !item.fetchedFull);
         const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
         const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
         const headContent = `
@@ -1114,7 +1165,7 @@ export function createChatInstance({
                     ${displayBody ? `aria-controls="${escapeHtmlAttr(bodyId)}"` : ''}
                 >
                     <span class="chat-live-line-head">${headContent}</span>
-                    <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : 'Expand'}</span>
+                    <span class="chat-live-line-expand-label">${expanded ? 'Collapse' : ((item.truncated && item.fullRef) ? 'Show full' : 'Expand')}</span>
                 </button>
             `
             : `<div class="chat-live-line-head">${headContent}</div>`;
@@ -1125,7 +1176,7 @@ export function createChatInstance({
                 data-expanded="${expanded ? '1' : '0'}"
             >
                 ${headHtml}
-                ${displayBody ? `<div class="chat-live-line-body" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody)}</div>` : ''}
+                ${displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody)}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
             </div>
         `;
     }
@@ -1133,6 +1184,35 @@ export function createChatInstance({
     // Full rebuild for initial render and expand/collapse toggles.
     function renderLiveCardTimeline(record) {
         record.timelineEl.innerHTML = record.items.map((item) => buildTimelineItemHtml(item, record)).join('');
+    }
+
+    // P3: fetch the genuinely-full output for a server-truncated timeline line (the WS
+    // preview was capped at 4000 chars), cache it on the item, then re-render if the line
+    // is still expanded. The full text is fetched on demand (not pushed over the socket)
+    // and shown in a bounded-scroll box. Best-effort — the capped preview stays on failure.
+    async function fetchFullLineOutput(item, record) {
+        item._fetchingFull = true;
+        try {
+            const resp = await apiFetch(`/api/tasks/${encodeURIComponent(item.fullRef)}`, { cache: 'no-store' });
+            const data = resp && typeof resp.json === 'function' ? await resp.json() : resp;
+            // Compose ALL available full fields — a subagent line can carry both a result AND a
+            // (separately truncated) trace_summary, so `result || trace_summary` would hide the
+            // full trace. Label each section when both are present.
+            const result = String((data && data.result) || '').trim();
+            const trace = String((data && data.trace_summary) || '').trim();
+            let full = '';
+            if (result && trace) full = `[RESULT]\n${result}\n\n[TRACE]\n${trace}`;
+            else full = result || trace;
+            if (full) item.fetchedFull = full;
+        } catch {
+            // best-effort: leave the capped preview on failure
+        } finally {
+            item._fetchingFull = false;
+            if (record.expandedLineKeys.has(item.lineKey)) {
+                renderLiveCardTimeline(record);
+                syncLiveCardLayout(record);
+            }
+        }
     }
 
     // Append without disturbing existing DOM nodes.
@@ -1223,7 +1303,10 @@ export function createChatInstance({
         record.phaseEl.dataset.phase = activePhase;
         record.phaseEl.textContent = formatLiveCardPhaseLabel(activePhase);
         record.phaseEl.className = `chat-live-phase ${activePhase}`;
-        record.titleEl.textContent = activeHeadline;
+        // Cluster B: a coined project name takes the title slot; the live activity
+        // headline still renders in the timeline lines below. Falls back to the
+        // activity headline until the proactive namer has produced a name.
+        record.titleEl.textContent = record.suggestedName || activeHeadline;
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
         // Legacy parent-subagent rows update in place if replayed from old
@@ -1245,6 +1328,8 @@ export function createChatInstance({
                 it.fullHeadline = summary.fullHeadline || headline || it.fullHeadline;
                 it.body = summary.body || '';
                 it.fullBody = summary.fullBody || summary.body || it.fullBody || '';
+                it.fullRef = summary.fullRef || it.fullRef || '';
+                it.truncated = summary.truncated || it.truncated || false;
                 it.ts = ts || it.ts;
                 patchIndex = existingIdx;
                 timelineUpdate = 'patch-at';
@@ -1255,6 +1340,8 @@ export function createChatInstance({
                 it.ts = ts || it.ts;
                 it.fullHeadline = summary.fullHeadline || it.fullHeadline || it.headline;
                 it.fullBody = summary.fullBody || it.fullBody || it.body;
+                it.fullRef = summary.fullRef || it.fullRef || '';
+                it.truncated = summary.truncated || it.truncated || false;
                 timelineUpdate = 'patch-last';
             } else if (existingIdx !== -1) {
                 // Already rendered earlier in this card (e.g. a historical progress line
@@ -1271,6 +1358,8 @@ export function createChatInstance({
                     fullHeadline: summary.fullHeadline || headline || 'Update',
                     body: summary.body || '',
                     fullBody: summary.fullBody || summary.body || '',
+                    fullRef: summary.fullRef || '',
+                    truncated: summary.truncated || false,
                     ts: ts || '',
                     count: 1,
                     dedupeKey: syntheticKey,
@@ -1355,6 +1444,10 @@ export function createChatInstance({
             finishLiveCard(taskId, 'done');
             return;
         }
+        // Cluster B: a card (re)built from a task_summary row also carries the coined name
+        // on reload (history attaches suggested_name to summary rows too) — apply it so the
+        // title survives even when no progress row was retained.
+        if (msg?.suggested_name) applySuggestedName(taskId, msg.suggested_name);
         const taskState = getTaskUiState(taskId, false);
         if (!taskState) {
             finishLiveCard(taskId, 'done');
@@ -1409,14 +1502,28 @@ export function createChatInstance({
         failed: 'failed', rejected: 'rejected', cancelled: 'cancelled', interrupted: 'interrupted',
     };
 
-    function formatSubagentHeadline(childId = '', role = '', label = '') {
+    // E2 (v6.39 UI): merge a subagent's parent/role/model, PRESERVING a previously-seen model
+    // when a later (model-less) event — e.g. a synthesized terminal — updates the entry, so the
+    // "role · model" headline survives the child's lifecycle.
+    function setSubagentParent(childId, { parentId = '', role = '', model = '' } = {}) {
+        const prev = subagentChildParents.get(childId) || {};
+        subagentChildParents.set(childId, {
+            parentId: parentId || prev.parentId || '',
+            role: role || prev.role || '',
+            model: String(model || '').trim() || prev.model || '',
+        });
+    }
+
+    function formatSubagentHeadline(childId = '', role = '', label = '', model = '') {
         const shortChild = String(childId || '').slice(0, 8);
         const cleanRole = String(role || '').trim();
         const suffix = label ? ` — ${label}` : '';
+        // Show the resolved model compactly NEXT TO the role (e.g. "planning-scout · gemini-3.5-flash").
+        const modelPart = compactModel(model) ? ` · ${compactModel(model)}` : '';
         if (cleanRole) {
-            return `${cleanRole}${shortChild ? ` (${shortChild})` : ''}${suffix}`;
+            return `${cleanRole}${modelPart}${shortChild ? ` (${shortChild})` : ''}${suffix}`;
         }
-        return `Subagent ${shortChild || 'child'}${suffix}`;
+        return `Subagent ${shortChild || 'child'}${modelPart}${suffix}`;
     }
 
     function updateLiveCardFromProgressMessage(msg) {
@@ -1460,6 +1567,10 @@ export function createChatInstance({
         });
         if (!summary) return;
         queueTaskLiveUpdate(summary, taskId, normalizeLogTs(msg.ts || new Date().toISOString()), summary.dedupeKey || '');
+        // Cluster B: history progress recs carry the coined name (live progress does
+        // not — the live path uses the separate `task_named` event). Apply it after the
+        // card exists so a reload shows the same title.
+        if (msg?.suggested_name) applySuggestedName(taskId, msg.suggested_name);
     }
 
     function updateSubagentCardFromEvent(evt, tsValue) {
@@ -1469,7 +1580,8 @@ export function createChatInstance({
         if (!parentId || !childId || parentId === childId) return false;
         const event = String(evt.subagent_event || 'update').toLowerCase();
         const role = String(evt.subagent_role || '').trim();
-        subagentChildParents.set(childId, { parentId, role });
+        setSubagentParent(childId, { parentId, role, model: evt.model });
+        const { model } = subagentChildParents.get(childId) || {};
         // NOTE: 'interrupted' is intentionally excluded — it is retryable
         // (written before requeue), so the child resumes and its later progress
         // must still flow to its card. Only true terminals lock it.
@@ -1479,7 +1591,7 @@ export function createChatInstance({
         const phase = SUBAGENT_EVENT_PHASE[event] || 'working';
         const label = SUBAGENT_EVENT_LABEL[event] || event;
         const shortChild = childId.slice(0, 8);
-        const headline = formatSubagentHeadline(childId, role, label);
+        const headline = formatSubagentHeadline(childId, role, label, model);
         // Surface the child's handoff (result/trace/error) as expandable detail
         // on the child card.
         const detailParts = [];
@@ -1513,10 +1625,10 @@ export function createChatInstance({
         const info = subagentChildParents.get(childId);
         if (!info) return;
         if (subagentTerminalChildren.has(childId)) return;  // never revive a finished child
-        const { parentId, role } = info;
+        const { parentId, role, model } = info;
         const shortChild = String(childId).slice(0, 8);
         const line = String(msg?.content || msg?.text || '').trim().split('\n').filter(Boolean).pop() || '';
-        const headline = formatSubagentHeadline(childId, role, 'running');
+        const headline = formatSubagentHeadline(childId, role, 'running', model);
         forceTaskCard(parentId);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
@@ -1538,7 +1650,7 @@ export function createChatInstance({
         const childId = String(taskId || '').trim();
         const info = subagentChildParents.get(childId);
         if (!childId || !info) return false;
-        const { parentId, role } = info;
+        const { parentId, role, model } = info;
         const shortChild = childId.slice(0, 8);
         const text = String(msg?.content || msg?.text || '').trim();
         forceTaskCard(parentId);
@@ -1547,7 +1659,7 @@ export function createChatInstance({
         if (role) meta.push(`role=${role}`);
         queueTaskLiveUpdate({
             phase: 'done',
-            headline: formatSubagentHeadline(childId, role, 'result'),
+            headline: formatSubagentHeadline(childId, role, 'result', model),
             body: text.slice(0, 200),
             fullBody: text,
             visible: true,
@@ -1605,6 +1717,7 @@ export function createChatInstance({
             subagent_task_id: childId,
             subagent_role: info.role,
             subagent_event: event,
+            model: info.model || '',
             result: evt.result || '',
             error: evt.error || '',
         }, evt.ts || evt.timestamp || new Date().toISOString());
@@ -1816,7 +1929,7 @@ export function createChatInstance({
                         const childId = String(msg.subagent_task_id || msg.task_id || '').trim();
                         if (!parentId || !childId || parentId === childId) continue;
                         if (!subagentChildParents.has(childId)) {
-                            subagentChildParents.set(childId, { parentId, role: String(msg.subagent_role || '').trim() });
+                            setSubagentParent(childId, { parentId, role: String(msg.subagent_role || '').trim(), model: msg.model });
                         }
                         const ev = String(msg.subagent_event || '').toLowerCase();
                         if (msg.task_terminal_status || ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(ev)) {
@@ -1945,7 +2058,6 @@ export function createChatInstance({
                     for (const msg of messages) {
                         if (msg.role !== 'user') continue;
                         let text = (msg.text || '').trim();
-                        if (text.startsWith(PLAN_PREFIX)) text = text.slice(PLAN_PREFIX.length).trimStart();
                         if (text) serverTexts.push(text);
                     }
                     const combined = [...serverTexts, ...inputHistory];
@@ -2124,8 +2236,8 @@ export function createChatInstance({
             showToast('Connection lost before send. Reconnect and try again.', 'error');
             return;
         }
-        // One-shot: disarm Consilium now that the message is sent.
-        if (planMode) setConsilium(false);
+        // One-shot: disarm Swarm now that the message is sent.
+        if (planMode) setSwarm(false);
         // Hand the objective to the NEXT main-chat live card this message spawns.
         if (isMain && objectiveText) _pendingCardObjective = objectiveText;
         if (hasAttachments) {
@@ -2148,14 +2260,14 @@ export function createChatInstance({
     // Send mode lives on DOM so CSS and click/Enter share one source.
     const sendGroup = page.querySelector('.chat-send-group');
 
-    // Consilium is a one-shot arm: the next send goes through plan_task multi-model
+    // Swarm is a one-shot arm: the next send goes through plan_task multi-model
     // brainstorm/planning, then the pill auto-disarms so it never sticks.
-    const consiliumBtn = byId('consilium');
-    function consiliumArmed() {
-        return consiliumBtn?.dataset.armed === 'true';
+    const swarmBtn = byId('swarm');
+    function swarmArmed() {
+        return swarmBtn?.dataset.armed === 'true';
     }
-    function setConsilium(armed) {
-        if (consiliumBtn) consiliumBtn.dataset.armed = armed ? 'true' : 'false';
+    function setSwarm(armed) {
+        if (swarmBtn) swarmBtn.dataset.armed = armed ? 'true' : 'false';
     }
 
     function setSendBusy(busy, label = '') {
@@ -2170,7 +2282,7 @@ export function createChatInstance({
         }
     }
 
-    consiliumBtn?.addEventListener('click', () => setConsilium(!consiliumArmed()));
+    swarmBtn?.addEventListener('click', () => setSwarm(!swarmArmed()));
 
     // Context-mode quick toggle (owner-only; applies on the next task). Posts to
     // the owner endpoint and reflects the current value from /api/state.
@@ -2238,11 +2350,11 @@ export function createChatInstance({
     });
 
     // Arrow wrappers avoid MouseEvent leaking into sendMessage(planMode).
-    sendBtn.addEventListener('click', () => sendMessage(consiliumArmed()));
+    sendBtn.addEventListener('click', () => sendMessage(swarmArmed()));
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            sendMessage(consiliumArmed());
+            sendMessage(swarmArmed());
             return;
         }
         if (e.key === 'ArrowUp' && !e.shiftKey) {
@@ -2513,6 +2625,14 @@ export function createChatInstance({
         // default to the main chat.
         if (!isMyThread(msg, { mirrorProject: true })) return;
         updateLiveCardFromLogEvent(msg.data);
+    });
+
+    // Cluster B: the proactive namer coined a project name for a fresh card — show it
+    // as the card title up front (turn-into-project then reuses the same name). Not
+    // thread-gated on chat_id: the broadcast carries only task_id, and applySuggestedName
+    // no-ops unless THIS thread already holds that card.
+    ws.on('task_named', (msg) => {
+        applySuggestedName(msg?.task_id || '', msg?.suggested_name || '');
     });
 
     ws.on('outbound_sent', (evt) => {

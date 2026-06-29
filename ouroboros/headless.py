@@ -49,6 +49,12 @@ ARTIFACT_TERMINAL_STATUSES = {
 # headless → task_status → outcomes → headless cycle, and the smoke test below
 # pins equality so the literal cannot drift from the SSOT.
 _FINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected_duplicate"})
+
+# Mirrors tool_capabilities.LOCAL_READONLY_SUBAGENT_MODE; a module-level import would risk
+# an import cycle (same rationale as _FINAL_STATUSES above), and the smoke test pins equality
+# so the literal cannot drift from this SSOT — the kind of re-derivation drift that stranded
+# the reaper's artifact finalization before task_is_readonly_subagent consolidated the gate.
+_LOCAL_READONLY_SUBAGENT_MODE = "local_readonly_subagent"
 _ARTIFACT_LIFECYCLE_FIELDS = {
     "artifact_status",
     "artifact_error",
@@ -83,6 +89,18 @@ _PATCH_JUNK_RE = re.compile(
     r"|\.pyc$|\.pyo$|^(dist|build)/|\.DS_Store|(^|/)\.coverage$"
     r"|coverage\.xml$|(^|/)htmlcov/"
 )
+_LOCKFILE_MANIFESTS = {
+    "package-lock.json": "package.json",
+    "npm-shrinkwrap.json": "package.json",
+    "yarn.lock": "package.json",
+    "pnpm-lock.yaml": "package.json",
+    "go.sum": "go.mod",
+    "Cargo.lock": "Cargo.toml",
+    "poetry.lock": "pyproject.toml",
+    "Pipfile.lock": "Pipfile",
+    "composer.lock": "composer.json",
+    "Gemfile.lock": "Gemfile",
+}
 _SENSITIVE_EXAMPLE_SUFFIXES = (".example", ".sample", ".template", ".dist")
 _SENSITIVE_KEY_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
 _SENSITIVE_FILENAMES = {
@@ -303,6 +321,53 @@ def prune_task_drives(
     return report
 
 
+def prune_task_trees(
+    parent_drive_root: pathlib.Path,
+    *,
+    retention_days: Optional[int] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Best-effort startup prune for ephemeral task-tree coordination ledgers
+    (``data/task_trees/<root_task_id>/blackboard.jsonl``). A tree's ledger is removed once
+    its ROOT task is terminal (or has no surviving result) and older than the GC retention
+    window — swarm-run coordination is transient, distinct from durable project memory."""
+
+    from ouroboros.retention import age_cutoff
+
+    parent = pathlib.Path(parent_drive_root)
+    base = parent / "task_trees"
+    days = _resolve_retention_days(retention_days)
+    cutoff = age_cutoff(days, now)
+    report: Dict[str, Any] = {"retention_days": days, "scanned": 0, "pruned": [], "skipped": [], "errors": []}
+    if not base.is_dir():
+        return report
+    for tree_dir in sorted(base.iterdir()):
+        if not tree_dir.is_dir():
+            continue
+        root_id = tree_dir.name
+        report["scanned"] += 1
+        try:
+            dir_mtime = tree_dir.stat().st_mtime
+            try:
+                from ouroboros.task_status import load_effective_task_result
+
+                result = load_effective_task_result(parent, root_id) or {}
+            except Exception:
+                result = load_task_result(parent, root_id) or {}
+            status = str(result.get("status") or "").lower()
+            if status and status not in _FINAL_STATUSES:
+                report["skipped"].append({"root_task_id": root_id, "reason": "root_not_terminal", "status": status})
+                continue
+            if _timestamp_from_result(result, dir_mtime) > cutoff:
+                report["skipped"].append({"root_task_id": root_id, "reason": "younger_than_retention"})
+                continue
+            shutil.rmtree(tree_dir)
+            report["pruned"].append({"root_task_id": root_id, "path": str(tree_dir)})
+        except Exception as exc:
+            report["errors"].append({"root_task_id": root_id, "error": f"{type(exc).__name__}: {exc}"})
+    return report
+
+
 def remove_subagent_task_drive(parent_drive_root: pathlib.Path, task_id: str) -> bool:
     """Immediately remove a subagent's child drive (used on cancel/timeout).
 
@@ -344,7 +409,7 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
         task_constraint = metadata.get("task_constraint") or {}
     readonly_subagent = (
         str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
-        and str(task_constraint.get("mode") or "") == "local_readonly_subagent"
+        and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
     )
     workspace_task = _workspace_root_from_task(task) is not None and not readonly_subagent
     child_status = str(child_result.get("status") or "completed")
@@ -445,6 +510,97 @@ def _copy_child_artifacts_to_parent(
     return rebased
 
 
+def task_is_readonly_subagent(task: Dict[str, Any]) -> bool:
+    """A local-readonly live subagent produces no durable owner-facing artifacts, so the
+    ``task_done`` finalize path (and the reaper that honors a self-finalized result) skip
+    artifact finalization for it. Single SSOT gate so every call site reads the same rule
+    instead of re-deriving it (a re-derivation drift is what stranded the reaper path)."""
+    if not isinstance(task, dict):
+        return False
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    task_constraint = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {}
+    if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
+        task_constraint = metadata.get("task_constraint") or {}
+    return (
+        str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
+        and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
+    )
+
+
+_DELIVERABLE_MANIFEST_FILE_CAP = 10000
+_DELIVERABLE_MANIFEST_HASH_CHUNK = 1024 * 1024  # 1 MiB streaming chunks (bounded memory)
+# Files larger than this are recorded by size only (hash skipped) so a single huge
+# binary/media/build artifact cannot wedge or OOM genesis finalization.
+_DELIVERABLE_MANIFEST_HASH_BYTE_CAP = 64 * 1024 * 1024  # 64 MiB
+
+
+def _build_deliverable_manifest(
+    workspace_root: pathlib.Path, task_id: str, project_id: str
+) -> Dict[str, Any]:
+    """Typed content listing of a from-scratch (genesis) project's deliverables
+    (deferral 3): rel path + size + sha256 per file, surfaced on the artifact axis so a
+    genesis project's OUTPUT (not just its patch diff) is inspectable. Excludes VCS and
+    virtualenv junk. P1 fail-loud: if the tree exceeds the file cap, ``truncated`` is set
+    instead of silently dropping files. Hashing STREAMS in fixed chunks (never loads a
+    whole file into memory) and skips the hash for files over the byte cap, so a large
+    artifact can neither OOM nor wedge finalization."""
+    import hashlib
+
+    contents: List[Dict[str, Any]] = []
+    count = 0
+    truncated = False
+    for root, dirs, files in os.walk(workspace_root):
+        dirs[:] = [d for d in dirs if d not in _TOP_LEVEL_EXCLUDE_DIRS and d != ".git"]
+        for fname in sorted(files):
+            if count >= _DELIVERABLE_MANIFEST_FILE_CAP:
+                truncated = True
+                break
+            fpath = pathlib.Path(root) / fname
+            if fpath.is_symlink():
+                # SECURITY: never follow a symlink out of the project — a genesis child
+                # could point one at an owner/runtime file outside workspace_root, and
+                # stat()/open() would then read/hash bytes outside the deliverable tree.
+                # Record it as a symlink WITHOUT reading the target.
+                contents.append({
+                    "rel": str(fpath.relative_to(workspace_root)),
+                    "symlink": True,
+                    "sha256": "",
+                })
+                count += 1
+                continue
+            try:
+                size = fpath.stat().st_size
+            except OSError:
+                continue
+            entry: Dict[str, Any] = {"rel": str(fpath.relative_to(workspace_root)), "size": size}
+            if size > _DELIVERABLE_MANIFEST_HASH_BYTE_CAP:
+                entry["sha256"] = ""
+                entry["hash_skipped"] = "size_over_cap"
+            else:
+                try:
+                    h = hashlib.sha256()
+                    with open(fpath, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(_DELIVERABLE_MANIFEST_HASH_CHUNK), b""):
+                            h.update(chunk)
+                    entry["sha256"] = h.hexdigest()
+                except Exception:
+                    continue
+            contents.append(entry)
+            count += 1
+        if truncated:
+            break
+    return {
+        "schema_version": 1,
+        "task_id": task_id,
+        "project_id": project_id,
+        "project_root": str(workspace_root),
+        "created_at": utc_now_iso(),
+        "file_count": count,
+        "truncated": truncated,
+        "contents": contents,
+    }
+
+
 def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Write patch/memory-export artifacts for a completed headless task."""
 
@@ -516,6 +672,36 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
                 artifact_status = ARTIFACT_STATUS_FAILED
             message = f"{type(exc).__name__}: {exc}"
             artifact_error = f"{artifact_error}; {message}" if artifact_error else message
+
+    # Deferral 3: a from-scratch (genesis) project gets a typed deliverable manifest on
+    # the artifact axis, so its OUTPUT files (not only the patch diff) are inspectable.
+    tc = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else \
+        (existing.get("task_constraint") if isinstance(existing.get("task_constraint"), dict) else {})
+    if (
+        workspace_root is not None
+        and str((tc or {}).get("surface") or "") == "genesis"
+        and workspace_root.is_dir()
+    ):
+        try:
+            manifest_path = artifact_dir / "deliverable_manifest.json"
+            dm = _build_deliverable_manifest(workspace_root, task_id, str(task.get("project_id") or ""))
+            atomic_write_json(manifest_path, dm, trailing_newline=True)
+            artifacts.append({
+                "kind": "deliverable_manifest",
+                "name": "deliverable_manifest.json",
+                "path": str(manifest_path),
+                "size": manifest_path.stat().st_size if manifest_path.exists() else 0,
+                "file_count": int(dm.get("file_count") or 0),
+                "truncated": bool(dm.get("truncated")),
+                "workspace_root": str(workspace_root),
+            })
+            if dm.get("truncated"):
+                log.warning(
+                    "deliverable_manifest truncated at cap %d for task %s",
+                    _DELIVERABLE_MANIFEST_FILE_CAP, task_id,
+                )
+        except Exception as exc:
+            log.debug("deliverable_manifest build failed for %s: %s", task_id, exc, exc_info=True)
 
     if artifacts or workspace_root is not None:
         existing = load_task_result(parent_drive_root, task_id) or {}
@@ -614,6 +800,7 @@ def write_workspace_patch_artifacts(
     errors: List[Dict[str, Any]] = []
     diagnostics: List[Dict[str, Any]] = []
     excluded: List[Dict[str, str]] = []
+    tracked_excluded: List[Dict[str, str]] = []
     sensitive: List[Dict[str, str]] = []
     included_untracked: List[str] = []
     task_base_sha = _acting_base_sha_from_task(task)
@@ -630,12 +817,7 @@ def write_workspace_patch_artifacts(
         root,
         errors,
     )
-    diffstat = _git_stdout(
-        ["git", "diff", "--stat", "--no-ext-diff", "--no-color", base_ref, "--"],
-        root,
-        allow_rc={0},
-        errors=errors,
-    )
+    diffstat = ""
     untracked = _git_path_list(["git", "ls-files", "-z", "--others", "--exclude-standard"], root, errors)
     for rel in untracked:
         sensitive_reason = _sensitive_untracked_reason(rel)
@@ -651,6 +833,15 @@ def write_workspace_patch_artifacts(
             excluded.append({"path": rel, "reason": blob_reason})
             continue
         included_untracked.append(rel)
+    incidental_lock_excludes = _incidental_lockfile_excludes([*changed_tracked, *included_untracked])
+    if incidental_lock_excludes:
+        kept_untracked: List[str] = []
+        for rel in included_untracked:
+            if rel in incidental_lock_excludes:
+                excluded.append({"path": rel, "reason": "incidental lockfile without sibling manifest change"})
+            else:
+                kept_untracked.append(rel)
+        included_untracked = kept_untracked
     if sensitive:
         errors.append({
             "type": "sensitive_untracked_files",
@@ -662,8 +853,20 @@ def write_workspace_patch_artifacts(
     total_size = 0
     with patch_path.open("wb") as fh:
         if not errors:
+            tracked_lock_excludes = sorted(set(changed_tracked) & incidental_lock_excludes)
+            tracked_pathspec = ["--"]
+            if tracked_lock_excludes:
+                tracked_pathspec += ["."] + [f":(exclude){rel}" for rel in tracked_lock_excludes]
+                for rel in tracked_lock_excludes:
+                    tracked_excluded.append({"path": rel, "reason": "incidental lockfile without sibling manifest change"})
+            diffstat = _git_stdout(
+                ["git", "diff", "--stat", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
+                root,
+                allow_rc={0},
+                errors=errors,
+            )
             total_size += _append_git_output(
-                ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, "--"],
+                ["git", "diff", "--binary", "--no-ext-diff", "--no-color", base_ref, *tracked_pathspec],
                 root,
                 fh,
                 hasher,
@@ -765,11 +968,13 @@ def write_workspace_patch_artifacts(
         "diffstat": diffstat,
         "counts": {
             "tracked_changed": len(changed_tracked),
+            "tracked_excluded": len(tracked_excluded),
             "untracked_included": len(included_untracked),
             "untracked_excluded": len(excluded),
             "sensitive_blocked": len(sensitive),
         },
         "tracked_changed": changed_tracked,
+        "tracked_excluded": tracked_excluded,
         "untracked_included": included_untracked,
         "untracked_excluded": excluded,
         "sensitive_blocked": sensitive,
@@ -1157,6 +1362,28 @@ def _patch_exclude_reason(rel: str) -> str:
     return ""
 
 
+def _lockfile_manifest_for(rel: str) -> str:
+    posix = str(rel).replace("\\", "/")
+    path = pathlib.PurePosixPath(posix)
+    manifest = _LOCKFILE_MANIFESTS.get(path.name)
+    return path.with_name(manifest).as_posix() if manifest else ""
+
+
+def _incidental_lockfile_excludes(changed_paths: List[str]) -> set[str]:
+    changed = {str(path or "").replace("\\", "/") for path in changed_paths if str(path or "").strip()}
+    lock_to_manifest = {
+        path: manifest
+        for path in changed
+        for manifest in [_lockfile_manifest_for(path)]
+        if manifest
+    }
+    if not lock_to_manifest:
+        return set()
+    if not (changed - set(lock_to_manifest)):
+        return set()
+    return {path for path, manifest in lock_to_manifest.items() if manifest not in changed}
+
+
 def _untracked_blob_exclude_reason(root: pathlib.Path, rel: str) -> str:
     """Reason to drop an untracked file from the workspace patch when it is a
     build/runtime BINARY or exceeds the per-file size cap. Keeps real-usage
@@ -1297,6 +1524,7 @@ __all__ = [
     "build_workspace_patch",
     "copy_child_task_result",
     "finalize_task_artifacts",
+    "task_is_readonly_subagent",
     "prepare_task_drive",
     "prune_headless_task_drives",
     "prune_task_drives",

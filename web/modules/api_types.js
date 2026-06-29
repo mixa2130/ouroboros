@@ -94,6 +94,8 @@
  * @property {boolean=} accepted
  * @property {number=} active_subagent_count
  * @property {number=} max_active_subagents
+ * @property {boolean=} queued_behind_active_cap
+ * @property {string[]=} required_capabilities
  * @property {string=} write_surface
  * @property {string=} model_lane
  * @property {string=} requested_model_lane
@@ -104,7 +106,9 @@
  * @property {string=} status
  * @property {number=} cost_usd
  * @property {string=} result
+ * @property {boolean=} result_truncated
  * @property {string=} trace_summary
+ * @property {boolean=} trace_summary_truncated
  * @property {string=} error
  * @property {string=} artifact_status
  * @property {Object=} artifact_bundle
@@ -174,6 +178,13 @@
  */
 
 /**
+ * @typedef {Object} TaskNamedOutbound
+ * @property {"task_named"} type
+ * @property {string} task_id
+ * @property {string} suggested_name  // proactively-coined project name; client sets the live card title (v6.40.0)
+ */
+
+/**
  * @typedef {Object} UploadResponse
  * @property {boolean} ok
  * @property {string} filename
@@ -206,6 +217,28 @@
  * @typedef {Object} OwnerScopeReviewFloorResponse
  * @property {boolean} ok
  * @property {string} scope_review_floor  // blocking_1m | advisory (v6.34.0, CW1)
+ */
+
+/**
+ * @typedef {Object} InstalledSkill
+ * @property {string} name
+ * @property {string} type
+ * @property {string=} version
+ * @property {string=} description
+ * @property {boolean=} enabled
+ * @property {string=} source
+ * @property {string=} payload_root
+ * @property {string=} review_status
+ * @property {boolean=} review_stale
+ * @property {Object=} review_gate
+ * @property {boolean=} executable_review
+ * @property {string=} review_profile
+ * @property {boolean=} official_hub_verified
+ * @property {boolean=} owner_attestable
+ * @property {{visible: boolean, disabled: boolean, reason: string}=} submit_hub
+ * @property {boolean=} is_self_authored
+ * @property {Object=} grants
+ * @property {string[]=} permissions
  */
 
 /**
@@ -246,6 +279,7 @@
  * @property {Object[]=} attachments
  * @property {Object=} allowed_resources
  * @property {Object=} resource_policy
+ * @property {string[]=} disabled_tools Declarative tool-policy denylist: tool names withheld from the agent (independent of allowed_resources).
  * @property {ExecutorRef=} executor_ref
  * @property {"stop"|"keep"=} service_teardown Task service finalization policy; `keep` is for external verifiers/owners that need live services after task completion. POSIX-only: on Windows a cancel/hard-timeout tree-kills all task processes, so `keep` is not preserved there.
  * @property {string=} deadline_at
@@ -336,4 +370,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.37.0';
+export const GATEWAY_CONTRACT_VERSION = '6.52.1';

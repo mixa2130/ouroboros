@@ -12,17 +12,21 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from ouroboros.config import apply_settings_to_env, get_max_subagent_depth, load_settings, save_settings
 from ouroboros.headless import prepare_task_drive, task_state_dir
 from ouroboros.contracts.task_contract import (
     build_task_contract,
     normalize_allowed_resources,
+    normalize_bool,
 )
 from ouroboros.tools.control_delegation import (
     _ensure_project_scope,
     child_budget_for_schedule,
+    normalize_required_capabilities,
+    profile_from_task_constraint,
+    resolve_cooperative_write_root,
 )
 from ouroboros.outcomes import normalize_outcome_axes, public_task_result
 from ouroboros.task_results import (
@@ -164,11 +168,18 @@ def _finalize_schedule_emission(
         )
     except Exception:
         pass
+    # B3: surface the RESOLVED model lane(s) to the parent (previously only in
+    # swarm_fanout telemetry / the child envelope) so it can see when auto resolved
+    # to light/heavy without inspecting events.
+    effective_lanes = [slot.effective_lane for _tid, slot in slot_tasks]
     if len(task_ids) == 1:
-        return f"Subagent request queued {task_ids[0]}: {objective}{worker_note}"
+        eff = effective_lanes[0] if effective_lanes else requested_model_lane
+        return f"Subagent request queued {task_ids[0]}: {objective} (effective_lane={eff}){worker_note}"
+    distinct_lanes = list(dict.fromkeys(effective_lanes))
+    lanes_note = distinct_lanes[0] if len(distinct_lanes) == 1 else ", ".join(distinct_lanes)
     return (
         f"Subagent group queued {task_group_id}: {', '.join(task_ids)} "
-        f"(lane={requested_model_lane}, slots={len(task_ids)}){worker_note}"
+        f"(requested_lane={requested_model_lane}, effective_lanes=[{lanes_note}], slots={len(task_ids)}){worker_note}"
     )
 
 
@@ -504,10 +515,13 @@ def _build_acting_constraint(
         )
     if not get_allow_mutative_subagents():
         return (
-            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: acting (mutative) subagents are turned "
-            "off in this runtime mode. Schedule a read-only subagent (omit "
-            "write_surface), or have the owner enable OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS "
-            "(default ON in advanced/pro, OFF in light)."
+            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: the OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS toggle "
+            "is not enabled. That toggle is the master gate: an explicit owner true/false "
+            "overrides the runtime-mode default, and runtime mode only sets the default when "
+            "the toggle is empty (default ON in advanced/pro, OFF in light). Schedule a "
+            "read-only subagent (omit write_surface), or have the owner enable "
+            "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS. Note: light blocks only self-repo/control-plane "
+            "writes (write_surface=self_worktree), not user/task/project deliverables."
         )
     grants: List[str] = []
     if isinstance(external_tool_grants, (list, tuple)):
@@ -535,7 +549,10 @@ def _build_acting_constraint(
 
 def _select_subagent_constraint(write_surface, write_root, protected_paths_grant, external_tool_grants, parent_workspace_root, caller_readonly=False):
     """Read-only default (no surface), a validated acting constraint, or an error string."""
-    if not write_surface:
+    if not write_surface or str(write_surface).strip().lower() == "read_only":
+        # `read_only` is the explicit, provider-safe alias for the omit-surface
+        # read-only path (the handler also normalizes it; this guard keeps the selector
+        # correct for any direct caller and matches the schema enum) — never acting.
         return {"mode": LOCAL_READONLY_SUBAGENT_MODE, "allow_enable": False, "allow_review": False}
     if caller_readonly:
         # A read-only subagent may delegate read-only children only — never spawn an acting one.
@@ -597,6 +614,57 @@ def _prepare_child_drives(slot_tasks, task_ids, status_drive_root, memory_mode, 
     return child_drives, ""
 
 
+def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a delegated child's task contract from a single spec mapping (extracted
+    from _schedule_task to keep it under the method size gate; one dict param to stay
+    within the parameter-count discipline; pure construction)."""
+    parent_contract = spec.get("parent_contract")
+    objective = spec.get("objective", "")
+    expected_output = spec.get("expected_output", "")
+    constraints = spec.get("constraints", "")
+    delegation_budget = spec.get("child_delegation_budget")
+    return build_task_contract({
+        "id": spec.get("tid"),
+        "type": "task",
+        "description": objective,
+        "objective": objective,
+        "expected_output": expected_output,
+        "constraints": constraints,
+        "workspace_root": spec.get("workspace_root", ""),
+        "workspace_mode": spec.get("workspace_mode", ""),
+        "project_id": spec.get("parent_project_id", ""),
+        "allowed_resources": spec.get("allowed_resources"),
+        "deadline_at": parent_contract.get("deadline_at") if isinstance(parent_contract, dict) else "",
+        "parent_task_id": spec.get("parent_task_id", ""),
+        "root_task_id": spec.get("root_task_id"),
+        "session_id": spec.get("session_id", ""),
+        "delegation_role": "subagent",
+        "metadata": {
+            "task_contract": {
+                **parent_contract,
+                "source": "parent_delegation",
+                "objective": objective,
+                "expected_output": expected_output,
+                "constraints": constraints,
+                "delegation_budget": delegation_budget,
+            } if isinstance(parent_contract, dict) else {"delegation_budget": delegation_budget},
+        },
+    })
+
+
+def _resolve_executor_ref(ctx: Any) -> dict:
+    """The child's workspace executor reference (docker/host), or {} when unavailable."""
+    accessor = getattr(ctx, "workspace_executor_ref", None)
+    if callable(accessor):
+        try:
+            candidate = accessor()
+            if isinstance(candidate, dict) and candidate:
+                return dict(candidate)
+        except Exception:
+            return {}
+    return {}
+
+
 def _schedule_task(
     ctx: ToolContext,
     objective: str = "",
@@ -614,6 +682,7 @@ def _schedule_task(
     may_mutate: bool = False,
     may_fan_out: bool = True,
     max_children: int = 0,
+    required_capabilities: Any = None,
     **legacy_or_unknown: Any,
 ) -> str:
     if legacy_or_unknown:
@@ -690,29 +759,48 @@ def _schedule_task(
     # the same per-project knowledge (Phase 3b); never re-derive a different id.
     parent_project_id = str(getattr(ctx, "project_id", "") or "").strip()
     requested_surface = str(write_surface or "").strip().lower()
-    from ouroboros.tool_access import active_tool_profile
+    # `read_only` is a first-class, provider-safe alias for "omit write_surface" (NOT a
+    # VALID_WRITE_SURFACES acting surface) — normalize it to the read-only path so
+    # constraint selection, mutating detection, and the event all treat it as read-only (P5).
+    if requested_surface == "read_only":
+        requested_surface = ""
+    # FR2: a flat parent requesting external_workspace with no write_root builds
+    # cooperatively in ONE host-minted shared tree (helper extracted to keep this
+    # method under the size gate).
+    effective_write_root, caller_profile, coop_err = resolve_cooperative_write_root(
+        ctx, requested_surface, write_root, workspace_root, metadata)
+    if coop_err:
+        return coop_err
     task_constraint = _select_subagent_constraint(
-        requested_surface, write_root, protected_paths_grant, external_tool_grants, workspace_root,
-        caller_readonly=(active_tool_profile(ctx) == "local_readonly_subagent"))
+        requested_surface, effective_write_root, protected_paths_grant, external_tool_grants, workspace_root,
+        caller_readonly=(caller_profile == "local_readonly_subagent"))
     if isinstance(task_constraint, str):
         return task_constraint
+    from ouroboros.tool_access import subagent_profile_satisfies
+
+    required_caps, cap_error = normalize_required_capabilities(required_capabilities)
+    if cap_error:
+        return f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {cap_error}"
+    selected_profile = profile_from_task_constraint(task_constraint)
+    ok, missing_caps = subagent_profile_satisfies(selected_profile, required_caps)
+    if not ok:
+        return (
+            "⚠️ SUBAGENT_CAPABILITY_MISMATCH: selected child profile "
+            f"{selected_profile!r} cannot satisfy required_capabilities={missing_caps}. "
+            "Pass an explicit write_surface for an acting child when those capabilities are genuinely required."
+        )
     allowed_resources = normalize_allowed_resources(
         (parent_contract.get("allowed_resources") if isinstance(parent_contract, dict) else {})
         or metadata.get("allowed_resources")
         or {}
     )
-    executor_ref = {}
-    executor_accessor = getattr(ctx, "workspace_executor_ref", None)
-    if callable(executor_accessor):
-        try:
-            candidate = executor_accessor()
-            if isinstance(candidate, dict) and candidate:
-                executor_ref = dict(candidate)
-        except Exception:
-            executor_ref = {}
-    lane_slots = expand_subagent_lane_slots(requested_model_lane, depth=new_depth)
+    executor_ref = _resolve_executor_ref(ctx)
+    # Auto lane: mutating children use Heavy; read-only children use Light.
+    child_mutating = bool(requested_surface) or normalize_bool(may_mutate)
+    lane_slots = expand_subagent_lane_slots(requested_model_lane, depth=new_depth, mutating=child_mutating)
     if not lane_slots:
         return "⚠️ SUBTASK_STATUS_ERROR: no subagent lane slots resolved; subagent was not scheduled."
+    _lane_downgrade_notes = [s.downgrade_note for s in lane_slots if s.downgrade_note]
     slot_tasks = [(uuid.uuid4().hex[:8], slot) for slot in lane_slots]
     task_ids: List[str] = [task_id for task_id, _slot in slot_tasks]
     emitted_modes: List[str] = []
@@ -735,8 +823,7 @@ def _schedule_task(
     if _drive_err:
         return _drive_err
 
-    # C3.1: propagate the parent's delegation INTENT to the child structurally (typed
-    # budget); only ever NARROWS within the parent (depth/active caps stay enforced).
+    # C3.1: propagate and narrow the parent's typed delegation intent.
     child_delegation_budget = child_budget_for_schedule(
         parent_contract,
         current_depth=current_depth, new_depth=new_depth, max_depth=max_depth,
@@ -752,32 +839,12 @@ def _schedule_task(
             slot_role = f"{role}:slot-{slot.slot_index + 1}"
         child_drive = child_drives.get(tid)
 
-        child_contract = build_task_contract({
-            "id": tid,
-            "type": "task",
-            "description": objective,
-            "objective": objective,
-            "expected_output": expected_output,
-            "constraints": constraints,
-            "workspace_root": workspace_root,
-            "workspace_mode": workspace_mode,
-            "project_id": parent_project_id,
-            "allowed_resources": allowed_resources,
-            "deadline_at": parent_contract.get("deadline_at") if isinstance(parent_contract, dict) else "",
-            "parent_task_id": parent_task_id,
-            "root_task_id": root_task_id,
-            "session_id": session_id,
-            "delegation_role": "subagent",
-            "metadata": {
-                "task_contract": {
-                    **parent_contract,
-                    "source": "parent_delegation",
-                    "objective": objective,
-                    "expected_output": expected_output,
-                    "constraints": constraints,
-                    "delegation_budget": child_delegation_budget,
-                } if isinstance(parent_contract, dict) else {"delegation_budget": child_delegation_budget},
-            },
+        child_contract = _build_child_subagent_contract({
+            "tid": tid, "objective": objective, "expected_output": expected_output, "constraints": constraints,
+            "workspace_root": workspace_root, "workspace_mode": workspace_mode, "parent_project_id": parent_project_id,
+            "allowed_resources": allowed_resources, "parent_contract": parent_contract,
+            "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
+            "child_delegation_budget": child_delegation_budget,
         })
         envelope = build_subagent_envelope(
             task_id=tid,
@@ -812,6 +879,7 @@ def _schedule_task(
             "write_surface": requested_surface,
             "task_contract": child_contract,
             "allowed_resources": allowed_resources,
+            "required_capabilities": required_caps,
             "model_lane": slot.requested_lane,
             "requested_model_lane": slot.requested_lane,
             "effective_model_lane": slot.effective_lane,
@@ -848,6 +916,7 @@ def _schedule_task(
                 executor_ref=executor_ref,
                 allowed_resources=allowed_resources,
                 task_contract=child_contract,
+                required_capabilities=required_caps,
                 chat_id=current_chat_id or None,
                 memory_mode=memory_mode,
                 drive_root=str(child_drive) if child_drive is not None else "",
@@ -879,7 +948,7 @@ def _schedule_task(
     for evt in events_to_emit:
         emitted_modes.append(_emit_control_event(ctx, evt))
 
-    return _finalize_schedule_emission(
+    _schedule_result = _finalize_schedule_emission(
         ctx,
         task_ids=task_ids,
         task_group_id=task_group_id,
@@ -893,34 +962,9 @@ def _schedule_task(
         slot_tasks=slot_tasks,
         emitted_modes=emitted_modes,
     )
-
-
-def _cancel_task(ctx: ToolContext, task_id: str) -> str:
-    try:
-        tid = validate_task_id(task_id)
-    except ValueError as exc:
-        return f"⚠️ TOOL_ARG_ERROR (cancel_task): {exc}"
-    # Latch a cancel-intent status on disk immediately so the parent's own
-    # find_child_tasks view treats the child as terminal right away — this stops
-    # the handoff-reminder loop from re-injecting "still scheduled" every round,
-    # even before the supervisor tears the task down.
-    try:
-        from ouroboros.task_results import STATUS_CANCEL_REQUESTED
-        metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-        status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-        write_task_result(
-            status_drive_root, tid, STATUS_CANCEL_REQUESTED,
-            result="Cancellation requested by agent; awaiting supervisor teardown.",
-        )
-    except Exception:
-        log.debug("Failed to latch cancel_requested status for %s", tid, exc_info=True)
-    # Emit live so the supervisor processes the cancellation within one loop tick
-    # instead of at end-of-round. schedule_subagent already emits live; cancel
-    # must be symmetric, otherwise a scheduled child looks stuck until the
-    # parent's whole turn finishes.
-    emitted = _emit_control_event(ctx, {"type": "cancel_task", "task_id": tid, "ts": utc_now_iso()})
-    note = " (live)" if emitted == "live" else " (deferred to round end)"
-    return f"Cancel requested: {tid}{note}"
+    if _lane_downgrade_notes and isinstance(_schedule_result, str):  # P1: not a silent horizon cut
+        _schedule_result += "\n⚠️ " + "; ".join(dict.fromkeys(_lane_downgrade_notes))
+    return _schedule_result
 
 
 def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
@@ -1113,12 +1157,14 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
         use_local = False
         if model == os.environ.get("OUROBOROS_MODEL") and os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
             use_local = True
-        elif model == os.environ.get("OUROBOROS_MODEL_CODE") and os.environ.get("USE_LOCAL_CODE", "").lower() in ("true", "1"):
+        elif model == os.environ.get("OUROBOROS_MODEL_HEAVY") and os.environ.get("USE_LOCAL_HEAVY", "").lower() in ("true", "1"):
             use_local = True
         elif model == os.environ.get("OUROBOROS_MODEL_LIGHT") and os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1"):
             use_local = True
-        elif model == os.environ.get("OUROBOROS_MODEL_FALLBACK") and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
-            use_local = True
+        else:
+            from ouroboros.config import get_fallback_models
+            if model in get_fallback_models() and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
+                use_local = True
 
         # CW2 (v6.34.0): the per-round re-gate downgrades the MODE for a sub-1M switch, but
         # the already-built transcript still carries the max-mode reference docs — switching
@@ -1194,6 +1240,28 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
     return output
 
 
+def _wait_attention_poll(ctx: ToolContext, after_ts: str) -> Callable[..., Any]:
+    """on_poll hook: break a sliced wait early when a child appends an attention beacon
+    (blocker/question/interface_contract/delegation_constraint) after the wait started, so a waiting parent reacts mid-flight."""
+    # tree_note/tree_read live in ouroboros/tools/task_tree.py (extracted for module size).
+    from ouroboros.tools.task_tree import tree_root_id
+
+    rid = tree_root_id(ctx)
+
+    def _hook(_results: Dict[str, Any], _terminal: Dict[str, bool]) -> Any:
+        if not rid:
+            return None
+        try:
+            from ouroboros.task_tree_ledger import tree_ledger_attention_after
+
+            att = tree_ledger_attention_after(rid, after_ts)
+        except Exception:
+            return None
+        return {"reason": "child_attention_beacon", "beacons": att[-5:]} if att else None
+
+    return _hook
+
+
 def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> str:
     """Wait for a subtask to reach a terminal status."""
     try:
@@ -1206,9 +1274,52 @@ def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> st
         timeout = 180
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-    waited = wait_for_effective_tasks(status_drive_root, [tid], timeout_sec=timeout)
-    header = "Task wait completed" if waited.get("all_terminal") else "Task wait timed out"
-    return f"{header} after {waited.get('elapsed_sec', 0):.1f}s.\n\n{_get_task_result(ctx, tid)}"
+    waited = wait_for_effective_tasks(
+        status_drive_root, [tid], timeout_sec=timeout,
+        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+    )
+    early = waited.get("early_return")
+    if early:
+        header = "Task wait interrupted by a child attention beacon"
+        extra = f"\n\n[CHILD_BEACONS]\n{json.dumps(early, ensure_ascii=False, indent=2)}\n[/CHILD_BEACONS]"
+    else:
+        header = "Task wait completed" if waited.get("all_terminal") else "Task wait timed out"
+        extra = ""
+    # B2 advisory (never a gate): if ANY other child of THIS parent is still in flight
+    # while we block on this one, point at wait_tasks(any_terminal) so the agent absorbs
+    # whichever finishes first instead of blocking serially on one id at a time.
+    other_live = _count_live_sibling_children(ctx, status_drive_root, exclude_task_id=tid)
+    if other_live >= 1:
+        extra += (
+            f"\n\n[ADVISORY] {other_live} other child(ren) still running/scheduled — consider "
+            "wait_tasks(any_terminal) to absorb whichever finishes first instead of waiting one at a time."
+        )
+    return f"{header} after {waited.get('elapsed_sec', 0):.1f}s.{extra}\n\n{_get_task_result(ctx, tid)}"
+
+
+def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, exclude_task_id: str) -> int:
+    """Count this parent's children still running/scheduled/requested (excluding the one
+    just waited on). Advisory only — a failure returns 0 so it never breaks wait_task."""
+    parent_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not parent_id:
+        return 0
+    try:
+        from ouroboros.task_results import (
+            STATUS_REQUESTED,
+            STATUS_RUNNING,
+            STATUS_SCHEDULED,
+            list_task_results,
+        )
+
+        live = 0
+        for item in list_task_results(status_drive_root, statuses=[STATUS_RUNNING, STATUS_SCHEDULED, STATUS_REQUESTED]):
+            if str(item.get("task_id") or item.get("id") or "") == exclude_task_id:
+                continue
+            if str(item.get("parent_task_id") or "") == parent_id:
+                live += 1
+        return live
+    except Exception:
+        return 0
 
 
 def _wait_for_tasks(
@@ -1239,7 +1350,10 @@ def _wait_for_tasks(
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): mode must be all_terminal or any_terminal."
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-    waited = wait_for_effective_tasks(status_drive_root, normalized_ids, timeout_sec=timeout, mode=normalized_mode)
+    waited = wait_for_effective_tasks(
+        status_drive_root, normalized_ids, timeout_sec=timeout, mode=normalized_mode,
+        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+    )
     tasks = waited.get("tasks")
     if isinstance(tasks, dict):
         public_tasks: Dict[str, Any] = {}
@@ -1253,6 +1367,8 @@ def _wait_for_tasks(
 
 
 def get_tools() -> List[ToolEntry]:
+    from ouroboros.tool_access import SUBAGENT_CAPABILITIES
+
     return [
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -1377,11 +1493,20 @@ def get_tools() -> List[ToolEntry]:
                 "genesis (a from-scratch new project — game/site/app/new Ouroboros — auto-provisioned as a fresh "
                 "empty git repo under the durable projects root; the project directory IS the deliverable, not "
                 "integrated into this repo). "
+                "COOPERATIVE MULTI-BUILDER vs GENESIS: when SEVERAL builder children must contribute to ONE new "
+                "deliverable together, give each write_surface=external_workspace and OMIT write_root — the host "
+                "mints ONE shared git tree the whole subagent tree writes into cooperatively (deeper descendants "
+                "inherit it), and you integrate it as the sole committer. Use genesis instead only when EACH child "
+                "should own its OWN standalone durable repo (e.g. best-of-N separate builds). "
                 "Mutative children still cannot commit, run "
                 "review/runtime/skills lifecycle, enable tools, or write cognitive memory. Nested delegation "
                 "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
                 "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
-                "request propagates structurally instead of collapsing into one flat layer. Always retrieve "
+                "request propagates structurally instead of collapsing into one flat layer. "
+                "BURST + ABSORB: when several children are INDEPENDENT, emit them in ONE batch (parallel "
+                "schedule_subagent calls in the same round) so they run concurrently, then absorb with "
+                "wait_tasks(any_terminal) — handling whichever finishes first — instead of scheduling and "
+                "blocking on them one at a time with serial wait_task calls. Always retrieve "
                 "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
             ),
             "parameters": {"type": "object", "properties": {
@@ -1397,32 +1522,37 @@ def get_tools() -> List[ToolEntry]:
                 },
                 "model_lane": {
                     "type": "string",
-                    "enum": ["auto", "main", "code", "light", "review", "scope"],
+                    "enum": ["auto", "main", "heavy", "light", "review", "scope"],
                     "default": "auto",
-                    "description": "Model lane for the child. auto uses safe light; main/code/light use those configured slots; review/scope fan out across configured reviewer slots and return a task_group. NOTE: this lane applies to FIRST-LEVEL children only — descendants at depth>=2 (grandchildren and deeper) always resolve to the configured Light Model slot, so point Light at a strong model if you want powerful deep subagents.",
+                    "description": "Model lane for the child. auto uses the cheap Light lane for a read-only child but the strong Heavy lane for a MUTATING first-level child — one that writes (a declared write_surface) OR is granted mutative-descendant intent (may_mutate); main/heavy/light use those configured slots (Heavy = strong acting/coding lane, empty Heavy/Light fall back to Main); review/scope fan out across configured reviewer slots and return a task_group. NOTE: an EXPLICIT main/heavy lane is honored only for children at or below the configured capability depth limit (advanced setting OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT, default 1 = direct children); deeper descendants resolve to Light to bound deep-swarm cost (a visible note is surfaced when an explicit request is capped).",
                 },
                 "write_surface": {
                     "type": "string",
                     # No empty-string member: Google Gemini's function-calling validator
                     # rejects empty enum values (400 INVALID_ARGUMENT). Read-only is the
-                    # default by OMITTING this param (handled in _select_subagent_constraint).
-                    "enum": ["self_worktree", "external_workspace", "genesis"],
-                    "description": "Omit = read-only child. Otherwise the isolated write surface for a mutative child (see tool description). Requires mutative subagents enabled (default ON in advanced/pro).",
+                    # default by OMITTING this param; `read_only` is an explicit, provider-safe
+                    # (non-empty) alias for the SAME read-only path, so an audit/read-only child
+                    # can NAME its intent instead of reaching for an acting surface like
+                    # self_worktree (the trap behind the read-only-audit cancel-storm). It is NOT
+                    # an acting VALID_WRITE_SURFACES member — it normalizes to the omit path.
+                    "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
+                    "description": "read_only (or omit) = read-only child auditing THIS repo. Otherwise the isolated write surface for a MUTATIVE child (see tool description). Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
                 },
-                "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory. Ignored for self_worktree and genesis (both auto-provisioned)."},
+                "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory. OMIT it to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
                 "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
                 "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
                 "delegation_intent": {"type": "string", "description": "Optional: tell THIS child whether/how to delegate further (e.g. 'build the whole game; spawn your own children per subsystem and let them spawn too'). Propagated structurally into the child's delegation budget and surfaced in its prompt, so a 'use maximum subagents / grandchildren' intent is not lost. Defaults to inheriting the parent's intent."},
                 "may_mutate": {"type": "boolean", "default": False, "description": "Optional: grant this child the intent to spawn MUTATIVE (acting) descendants of its own. Still bounded by the usual mutative-subagent gating and depth/active caps."},
                 "may_fan_out": {"type": "boolean", "default": True, "description": "Optional: whether this child may spawn MULTIPLE children (a wave). Bounded by the per-root active cap."},
                 "max_children": {"type": "integer", "default": 0, "description": "Optional soft cap on this child's own direct children (0 = inherit / configured cap)."},
+                "required_capabilities": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(SUBAGENT_CAPABILITIES)},
+                    "description": "Closed-enum capabilities this child must have (e.g. shell/vcs/write/service). The scheduler reconciles this with the selected profile before spawning; do not encode these needs in prose.",
+                },
             }, "required": ["objective", "expected_output"], "additionalProperties": False},
         }, _schedule_task),
-        ToolEntry("cancel_task", {
-            "name": "cancel_task",
-            "description": "Cancel a task by ID.",
-            "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]},
-        }, _cancel_task),
+        # cancel_task + peek_task + discard_child_result are registered by ouroboros/tools/join_ledger.py.
         ToolEntry("request_deep_self_review", {
             "name": "request_deep_self_review",
             "description": "Request an Atlas-backed deep self-review of the entire Ouroboros project. Uses OUROBOROS_MODEL_DEEP_SELF_REVIEW with its matching provider key, full core memory whitelist, and manifest accounting for every tracked repo path against the Constitution. Results go to chat and memory.",
@@ -1509,7 +1639,7 @@ def get_tools() -> List[ToolEntry]:
         }, _get_task_result),
         ToolEntry("wait_task", {
             "name": "wait_task",
-            "description": "Wait for a subtask to reach a terminal status and return its effective result.",
+            "description": "Wait for ONE subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer or override it. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID to check"},
                 "timeout_sec": {"type": "integer", "default": 180, "description": "Maximum seconds to wait (default 180)."},
@@ -1517,7 +1647,7 @@ def get_tools() -> List[ToolEntry]:
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
             "name": "wait_tasks",
-            "description": "Wait for multiple subtasks and return full effective results for each child.",
+            "description": "Wait for MULTIPLE subtasks at once and return full effective results for each child — the right tool to ABSORB a batch of independent children you scheduled in one burst. With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/delegation_constraint beacon so you can steer or override mid-flight.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
                 "timeout_sec": {"type": "integer", "default": 600, "description": "Maximum seconds to wait (default 600)."},

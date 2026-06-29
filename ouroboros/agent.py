@@ -162,6 +162,7 @@ class OuroborosAgent:
                     self.env.drive_root,
                     str(task.get("id") or ""),
                     STATUS_RUNNING,
+                    chat_id=task.get("chat_id"),
                     parent_task_id=task.get("parent_task_id"),
                     root_task_id=task.get("root_task_id"),
                     session_id=task.get("session_id"),
@@ -253,6 +254,16 @@ class OuroborosAgent:
         ):
             if task.get(key) not in (None, ""):
                 task_metadata[key] = task.get(key)
+        # Surface the time budget for the LLM-visible pacing milestones + graceful self-finalize,
+        # which read task_metadata["deadline_at"] (loop.py / deadline_utils.py). Root tasks set it
+        # via /api/tasks, but subagents inherit the parent deadline only in task_contract — so when
+        # the top-level metadata lacks it, populate it from the contract. Without this, spawned
+        # subagents run deadline-blind (no pacing, no partial-result finalize before a hard cut).
+        if not str(task_metadata.get("deadline_at") or "").strip():
+            _contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
+            _inherited_deadline = str(_contract.get("deadline_at") or "").strip()
+            if _inherited_deadline:
+                task_metadata["deadline_at"] = _inherited_deadline
         _tc_meta = task.get("task_constraint")
         _surface_meta = str((_tc_meta.get("surface") if isinstance(_tc_meta, dict) else "") or "")
         if _surface_meta:
@@ -297,6 +308,11 @@ class OuroborosAgent:
                 ctx.task_model_override = model_override
             if "use_local_model" in task_metadata:
                 ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
+        # NOTE: the ephemeral decision turn is INTENTIONALLY kept on the SAME route as the
+        # main chat (no light-lane override): a busy-chat ephemeral turn can produce the
+        # owner-facing answer inline (WS10), so silently lowering its model would be a P1
+        # owner-invisible cognitive-horizon cut. The #4 self-DoS class is handled by the
+        # per-model concurrency semaphore (ouroboros/model_concurrency.py), not by routing.
         self.tools.set_context(ctx)
 
         self._emit_typing_start()
@@ -321,6 +337,7 @@ class OuroborosAgent:
             task=task,
             review_context_builder=lambda: build_review_context(self.env),
             soft_cap_tokens=_soft_cap,
+            ctx=ctx,
         )
 
         budget_remaining = None

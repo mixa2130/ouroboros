@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from supervisor.state import load_state, append_jsonl, reconstruct_task_cost
 from supervisor.message_bus import send_with_budget
-from ouroboros.outcomes import EXECUTION_INFRA_FAILED, terminal_outcome_axes
+from ouroboros.outcomes import EXECUTION_FAILED, EXECUTION_INFRA_FAILED, terminal_outcome_axes
 from ouroboros.utils import utc_now_iso
 
 
@@ -85,6 +85,10 @@ class Worker:
     proc: mp.Process
     in_q: Any
     busy_task_id: Optional[str] = None
+    # Variant A (off-loop reaping): set under _queue_lock when a timed-out task's heavy
+    # teardown (kill/join/archive/respawn) is handed to the background reaper. The slot
+    # is unavailable for assignment until respawn_worker() installs a fresh Worker.
+    reaping: bool = False
 
 
 _EVENT_Q = None
@@ -231,6 +235,19 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> None:
         task["workspace_mode"] = "external"
     attach_task_contract(task)
     ctx.enqueue_task(task)
+    # v6.40 "name ANY task card": the agent already coined `title` here (zero extra LLM
+    # call), so persist it as suggested_name + emit task_named so the promoted card shows
+    # the human title up front exactly like a proactively-named direct-chat card, and a
+    # later turn-into-project reuses it. Same-status (SCHEDULED) write — merges, never
+    # regresses; fail-soft.
+    if title:
+        try:
+            from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+
+            write_task_result(DRIVE_ROOT, tid, STATUS_SCHEDULED, suggested_name=title)
+            _broadcast_task_named({"type": "task_named", "task_id": tid, "suggested_name": title})
+        except Exception:
+            log.debug("promote: suggested_name persist/broadcast failed for %s", tid, exc_info=True)
 
 
 def ensure_project_scope(evt: dict, ctx: Any) -> None:
@@ -262,15 +279,16 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
         # supervisor RUNNING map, which (unlike the promote path that sets it at
         # build time) is NOT set for a mid-flight self-scope. Without this, a task
         # that self-scopes to project X would not hold X's lane and a concurrent
-        # X task could be assigned and write the same project.
+        # X task could be assigned and write the same project. SSOT helper shared
+        # with the UI api_project_from_task convert path so the two cannot drift.
         try:
+            from ouroboros.project_lease import mark_task_project
+
             running = getattr(ctx, "RUNNING", None)
+            pending = getattr(ctx, "PENDING", None)
             if isinstance(running, dict):
                 with _queue_lock:
-                    meta = running.get(tid)
-                    task_dict = meta.get("task") if isinstance(meta, dict) else None
-                    if isinstance(task_dict, dict):
-                        task_dict["project_id"] = pid
+                    mark_task_project(running, pending, tid, pid)
         except Exception:
             log.debug("ensure_project_scope: RUNNING project_id update failed for %s", tid, exc_info=True)
         if proj_chat:
@@ -323,6 +341,16 @@ def _handle_chat_direct_locked(
     )
 
 
+def _broadcast_task_named(msg: dict) -> None:
+    """Bridge broadcast callback for the proactive namer (kept tiny + fail-soft)."""
+    try:
+        from supervisor.message_bus import get_bridge
+
+        get_bridge().broadcast(msg)
+    except Exception:
+        log.debug("task_named broadcast failed", exc_info=True)
+
+
 def _run_chat_task(
     agent: Any,
     chat_id: int,
@@ -370,15 +398,50 @@ def _run_chat_task(
                     except Exception:
                         log.debug("bind_task_to_project failed for direct project task %s/%s", task["id"], pid, exc_info=True)
         if image_data:
-            # image_data is (base64, mime) or (base64, mime, caption).
+            # image_data is (base64, mime) or (base64, mime, caption). The caption
+            # still seeds task['text'] (and the legacy inline image path below) so a
+            # caption-only message keeps working even when nothing stages.
             task["image_base64"] = image_data[0]
             task["image_mime"] = image_data[1]
             if len(image_data) > 2 and image_data[2]:
                 task["image_caption"] = image_data[2]
                 if not text:
                     task["text"] = image_data[2]
+        # v6.52.0 (P1, full desktop unify): route the WHOLE desktop attachment set
+        # (any type) through the shared staging substrate so the agent gets EVERY
+        # attachment — images natively via attachment_images + non-images via the
+        # read_file(root='artifact_store', path='attachments/...') manifest — exactly
+        # like the CLI/API/GAIA path. The uploads are resolved from data/uploads/ in
+        # ws._chat_attachment_uploads and carried as task['metadata'] (like force_plan).
+        # On a non-empty manifest we DROP the legacy inline image_base64 so the same
+        # image is not double-injected; on absent/empty uploads (older clients, the
+        # single-image base64 seam) the legacy inline path above stays untouched.
+        meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        uploads = meta.get("chat_attachment_uploads")
+        if uploads:
+            from ouroboros.artifacts import stage_task_attachments
+            from ouroboros.gateway.tasks import _render_attachment_lines
+
+            manifest = stage_task_attachments(DRIVE_ROOT, str(task["id"]), uploads)
+            if manifest:
+                task["drive_root"] = str(DRIVE_ROOT)
+                task["attachment_images"] = [m for m in manifest if m.get("is_image")]
+                rendered = _render_attachment_lines(manifest)
+                if rendered:
+                    task["text"] = f"{task.get('text') or ''}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
+                task.pop("image_base64", None)
+                task.pop("image_mime", None)
         if not task["text"]:
             task["text"] = "(image attached)" if image_data else ""
+        # Cluster B: proactively coin a project name for a fresh MAIN-CHAT direct card
+        # (not an ephemeral decision turn, not an already-bound project-thread task) so
+        # the card shows a human title up front and turn-into-project reuses it.
+        if not ephemeral and not task.get("project_id"):
+            from ouroboros.project_naming import spawn_proactive_namer
+
+            spawn_proactive_namer(
+                DRIVE_ROOT, str(task["id"]), task["text"], broadcast=_broadcast_task_named
+            )
         attach_task_contract(task)
         events = agent.handle_task(task)
         for e in events:
@@ -724,6 +787,7 @@ def _emit_task_done_terminal(
     task_id: str,
     status: str = "failed",
     *,
+    reason_code: str = "",
     cost_usd: float = 0.0,
     total_rounds: int = 0,
     prompt_tokens: int = 0,
@@ -745,7 +809,8 @@ def _emit_task_done_terminal(
     if not chat_id:
         return
     status = status or "failed"
-    reason_code = "worker_terminal_failure" if status == "failed" else status
+    # Caller reason_code wins; budget_exhausted -> EXECUTION_FAILED below, not infra-failure.
+    reason_code = reason_code or ("worker_terminal_failure" if status == "failed" else status)
     try:
         get_event_q().put({
             "type": "task_done",
@@ -755,7 +820,7 @@ def _emit_task_done_terminal(
             "status": status,
             "outcome_axes": terminal_outcome_axes(
                 lifecycle=status,
-                execution=EXECUTION_INFRA_FAILED if status == "failed" else status,
+                execution=(EXECUTION_FAILED if reason_code == "budget_exhausted" else EXECUTION_INFRA_FAILED) if status == "failed" else status,
                 reason_code=reason_code,
                 review_trigger="worker_terminal",
             ),
@@ -1167,8 +1232,19 @@ def assign_tasks() -> None:
     with _queue_lock:
         st = load_state()
         remaining = budget_remaining(st)
-        
         if remaining <= 0:
+            # Budget exhausted: PENDING has no timeout backstop. Terminally fail stranded
+            # tasks with an OBSERVABLE budget_exhausted result + task_done so waiters resolve.
+            _stranded, PENDING[:] = list(PENDING), []
+            if _stranded:
+                from ouroboros.task_results import fail_tasks
+                _bmsg = "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings."
+                fail_tasks(DRIVE_ROOT, _stranded, reason_code="budget_exhausted", result=_bmsg)
+                for _t in _stranded:  # resolve the live UI/SSE card (no-ops without a chat_id)
+                    _emit_task_done_terminal(_t, str(_t.get("id") or ""), reason_code="budget_exhausted")
+                if st.get("owner_chat_id"):
+                    send_with_budget(int(st["owner_chat_id"]), _bmsg)
+                queue.persist_queue_snapshot(reason="budget_exhausted")
             return  # Stop assigning ALL tasks if budget is completely exhausted
 
         # Drop tasks cancelled after scheduling but before assignment.
@@ -1196,9 +1272,47 @@ def assign_tasks() -> None:
             queue.persist_queue_snapshot(reason="evolution_blocked_light")
 
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
+        from ouroboros.config import get_max_active_subagents_per_root
+
+        def _running_subagent_count(root_task_id: str) -> int:
+            if not root_task_id:
+                return 0
+            count = 0
+            for meta in RUNNING.values():
+                task = meta.get("task") if isinstance(meta, dict) else None
+                if (
+                    isinstance(task, dict)
+                    and str(task.get("delegation_role") or "") == "subagent"
+                    and str(task.get("root_task_id") or "") == root_task_id
+                ):
+                    count += 1
+            return count
+
+        def _assignment_depth_reservation_admits(candidate: dict) -> bool:
+            root_task_id = str(candidate.get("root_task_id") or "")
+            parent_id = str(candidate.get("parent_task_id") or "").strip()
+            if not root_task_id or not parent_id:
+                return False
+            parent_running = any(
+                str((meta.get("task") if isinstance(meta, dict) else {}).get("id") or "") == parent_id
+                and str((meta.get("task") if isinstance(meta, dict) else {}).get("root_task_id") or "") == root_task_id
+                and str((meta.get("task") if isinstance(meta, dict) else {}).get("delegation_role") or "") == "subagent"
+                for meta in RUNNING.values()
+            )
+            if not parent_running:
+                return False
+            direct_running_children = sum(
+                1 for meta in RUNNING.values()
+                if isinstance(meta, dict)
+                and isinstance(meta.get("task"), dict)
+                and str(meta["task"].get("root_task_id") or "") == root_task_id
+                and str(meta["task"].get("delegation_role") or "") == "subagent"
+                and str(meta["task"].get("parent_task_id") or "").strip() == parent_id
+            )
+            return direct_running_children < 1
 
         for w in WORKERS.values():
-            if w.busy_task_id is None and PENDING:
+            if w.busy_task_id is None and not getattr(w, "reaping", False) and PENDING:
                 # One-writer-per-project lease: recompute per assignment so a
                 # task assigned in THIS loop pass immediately occupies its lane.
                 leased = running_project_ids(RUNNING.values())
@@ -1210,6 +1324,13 @@ def assign_tasks() -> None:
                         continue
                     if not candidate_is_leasable(candidate, leased):
                         continue
+                    if str(candidate.get("delegation_role") or "") == "subagent":
+                        root_task_id = str(candidate.get("root_task_id") or "")
+                        if (
+                            _running_subagent_count(root_task_id) >= get_max_active_subagents_per_root()
+                            and not _assignment_depth_reservation_admits(candidate)
+                        ):
+                            continue
                     chosen_idx = i
                     break
                 if chosen_idx is None:
@@ -1300,6 +1421,12 @@ def _ensure_workers_healthy_locked(queue: Any) -> None:
     dead_detections = 0
     crashed_tasks = []
     for wid, w in list(WORKERS.items()):
+        # Variant A: a slot marked `reaping` is owned end-to-end by the background reaper
+        # (kill -> join -> archive -> respawn). Its proc is expected to die mid-reap, so the
+        # crash detector must NOT also respawn it — that double-respawn would orphan a live
+        # worker process. The reaper installs a fresh Worker (reaping=False) when done.
+        if getattr(w, "reaping", False):
+            continue
         if not w.proc.is_alive():
             dead_detections += 1
             if w.busy_task_id is not None:

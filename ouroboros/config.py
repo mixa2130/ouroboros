@@ -83,12 +83,21 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
     "OUROBOROS_MODEL": "google/gemini-3.5-flash",
-    "OUROBOROS_MODEL_CODE": "google/gemini-3.5-flash",
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3.5-flash",
+    # Worker lanes. Empty means "use OUROBOROS_MODEL" (same shape as consciousness),
+    # so the owner sets ONE model by default and optionally overrides a lane. HEAVY is
+    # the strong acting/coding lane (mutative first-level subagents); LIGHT is the cheap
+    # bulk lane (auto / deep subagents). (HEAVY renamed from the legacy MODEL_CODE.)
+    "OUROBOROS_MODEL_HEAVY": "",
+    "OUROBOROS_MODEL_LIGHT": "",
+    "OUROBOROS_MODEL_VISION": "",
+    "OUROBOROS_IMAGE_INPUT_MODE": "auto",
     # Background consciousness is a high-horizon cognitive loop, not a cheap
     # helper lane. Empty means "use OUROBOROS_MODEL".
     "OUROBOROS_MODEL_CONSCIOUSNESS": "",
-    "OUROBOROS_MODEL_FALLBACK": "anthropic/claude-sonnet-4.6",
+    # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
+    # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
+    # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
+    "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/gpt-5.5-pro",
     "CLAUDE_CODE_MODEL": "opus[1m]",
     "OUROBOROS_MAX_WORKERS": 10,
@@ -102,6 +111,7 @@ SETTINGS_DEFAULTS = {
     # outside repo/ and data/). genesis projects are durable and never GC'd.
     "OUROBOROS_SUBAGENT_WORKTREE_ROOT": "",
     "OUROBOROS_SUBAGENT_PROJECTS_ROOT": "",
+    "OUROBOROS_DELIVERABLES_ROOT": "",
     # Unified age-based GC retention (days) for ALL disposable runtime artifacts:
     # subagent worktrees, headless/direct task drives, and leftover service logs.
     # Single owner-facing knob (math SSOT in ouroboros/retention.py); deprecated
@@ -112,21 +122,48 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC": 120,
     "TOTAL_BUDGET": 10.0,
     "OUROBOROS_PER_TASK_COST_USD": 20.0,
+    # cloud.ru Foundation Models catalog prices token costs in RUB per 1M; budget is
+    # USD. Owner-configurable RUB->USD divisor for converting cloud.ru cost to USD.
+    "OUROBOROS_RUB_USD_RATE": 95.0,
+    # Live-pricing (OpenRouter + cloud.ru catalog) refetch interval; prices/FX drift.
+    "OUROBOROS_PRICING_TTL_SEC": 21600,
     # Main-loop round ceiling (was an inline literal in loop.py — hot-reloadable now).
     "OUROBOROS_MAX_ROUNDS": 200,
     # Same-model attempt budget for TRANSIENT provider failure classes
     # (finish_reason=null, 429/5xx/overloaded); floored at the caller's base
     # retry budget. Permanent classes fail fast regardless.
     "OUROBOROS_TRANSIENT_RETRY_MAX": 6,
+    # #4 self-DoS guard: max concurrent provider calls per (model, use_local) route; excess
+    # worker threads wait (deadline-bounded) instead of storming one model's rate limit. <=0
+    # disables. Default-on, fail-soft (see ouroboros/model_concurrency.py).
+    "OUROBOROS_MODEL_MAX_CONCURRENCY": 3,
+    # Hard ceiling (seconds) a provider call waits for a concurrency slot when the task has
+    # NO deadline; past it the call proceeds WITHOUT a slot (never blocks forever). SSOT here.
+    "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC": 180,
+    # Project-naming LIGHT-call waits (v6.40): the provider-call transport timeout and the
+    # gateway's hard wait for the inline turn-into-project name. SSOT here (not magic numbers
+    # in project_naming.py) per DEVELOPMENT "Timeout & Wait Control".
+    "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC": 60,
+    "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC": 8,
     # Skill lifecycle lane deadline (wedged-job loud-failure bound).
     "OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC": 1800,
     "OUROBOROS_SOFT_TIMEOUT_SEC": 600,
+    # NOTE: OUROBOROS_HARD_TIMEOUT_SEC no longer terminates tasks — the flat wall-clock
+    # kill was replaced by the activity model below (idle + subtree-liveness, abs ceiling).
+    # It survives only as a soft-warning/status display input; runtime is governed by
+    # OUROBOROS_TASK_IDLE_TIMEOUT_SEC and OUROBOROS_TASK_ABS_CEILING_SEC.
     "OUROBOROS_HARD_TIMEOUT_SEC": 1800,
+    # Activity-based liveness (replaces flat wall-clock as the primary stop):
+    # idle window = no real progress AND no progressing subtree; abs ceiling = the
+    # unconditional per-task backstop (budget/cost stays a separate hard axis).
+    "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
+    "OUROBOROS_TASK_ABS_CEILING_SEC": 21600,
     "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
     "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
     "OUROBOROS_PACING_INTERVAL_SEC": PACING_INTERVAL_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
+    "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC": 90,
     "OUROBOROS_BG_MAX_ROUNDS": 10,
     "OUROBOROS_BG_WAKEUP_MIN": 30,
     "OUROBOROS_BG_WAKEUP_MAX": 7200,
@@ -141,6 +178,21 @@ SETTINGS_DEFAULTS = {
     # overrides the LLM-first promotion). Empty = pure LLM choice.
     "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE": "",
     "OUROBOROS_WEBSEARCH_MODEL": "gpt-5.2",
+    # web_search backend pin: auto (default OpenAI-first cascade) | ddgs (pure
+    # retrieval, no second LLM — for fixed-model runs) | openai | openrouter | anthropic.
+    "OUROBOROS_WEBSEARCH_BACKEND": "auto",
+    # OpenRouter provider routing: "" (off) | resilience (same-model failover, cache-warm)
+    # | repro (pin, no failover — fixed-model runs) | a raw JSON `provider` object.
+    "OUROBOROS_OR_PROVIDER": "",
+    # search_code total wall-clock budget (seconds) bounding the rg walk + the fallback walk.
+    "OUROBOROS_SEARCH_CODE_WALL_SEC": "45",
+    # NOTE: OUROBOROS_OBSERVABILITY_KEEP_RAW (writes UNREDACTED secret-bearing payloads to
+    # disk) is intentionally NOT a settings/UI carrier — it is an env-only operator debug
+    # override so a self-change or non-owner save can never enable secret logging.
+    # Generative context-window probe (Max gate): on (default) confirms a route's >=1M
+    # window from a FREE over-window reject; *_CHARS sizes the oversized padding.
+    "OUROBOROS_GENERATIVE_PROBE": "1",
+    "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-opus-4.8",
     # Pre-commit review enforcement: advisory | blocking
@@ -194,6 +246,7 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "high",
     "OUROBOROS_EFFORT_CONSCIOUSNESS": "high",
     "OUROBOROS_RETURN_REASONING": True,
+    "OUROBOROS_REASONING_SUMMARY": "auto",
     "GITHUB_TOKEN": "",
     "GITHUB_REPO": "",
     # Local model (llama-cpp-python server)
@@ -204,21 +257,103 @@ SETTINGS_DEFAULTS = {
     "LOCAL_MODEL_CONTEXT_LENGTH": 16384,
     "LOCAL_MODEL_CHAT_FORMAT": "",
     "USE_LOCAL_MAIN": False,
-    "USE_LOCAL_CODE": False,
+    "USE_LOCAL_HEAVY": False,
     "USE_LOCAL_LIGHT": False,
     "USE_LOCAL_CONSCIOUSNESS": False,
     "USE_LOCAL_FALLBACK": False,
     "OUROBOROS_FILE_BROWSER_DEFAULT": "",
+    # Subagent depth at/below which an EXPLICIT main/heavy lane is honored; deeper
+    # descendants (grandchildren) fall to light as a cost guard. Owner-configurable
+    # (advanced); a visible note is surfaced when an explicit request is depth-capped.
+    "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT": 1,
+    # 429-aware cross-model fallback: process-local cooldown for transiently failing
+    # models (429/5xx/overloaded), passive heal-back. Owner-tunable; default-on, fail-soft.
+    "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
+    "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
+    "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
 }
 
 
-def get_light_model() -> str:
-    """Return the configured light-model slot with runtime env override."""
-
+def _main_model() -> str:
     return (
-        str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
-        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"])
+        str(os.environ.get("OUROBOROS_MODEL", "") or "").strip()
+        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
     )
+
+
+def get_light_model() -> str:
+    """Return the light-model slot; empty falls back to OUROBOROS_MODEL (only main
+    carries a real default — heavy/light/consciousness are empty->main)."""
+    return str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
+
+
+def get_heavy_model() -> str:
+    """Return the heavy (strong acting/coding) lane slot; empty falls back to
+    OUROBOROS_MODEL. Renamed from the legacy code slot."""
+    return str(os.environ.get("OUROBOROS_MODEL_HEAVY", "") or "").strip() or _main_model()
+
+
+def get_vision_model() -> str:
+    """Return the vision/caption model slot; empty falls back to OUROBOROS_MODEL."""
+    return str(os.environ.get("OUROBOROS_MODEL_VISION", "") or "").strip() or _main_model()
+
+
+def get_image_input_mode() -> str:
+    raw = str(os.environ.get("OUROBOROS_IMAGE_INPUT_MODE", SETTINGS_DEFAULTS["OUROBOROS_IMAGE_INPUT_MODE"]) or "").strip().lower()
+    return raw if raw in {"auto", "caption", "inline", "off"} else "auto"
+
+
+def parse_fallback_chain() -> list[str]:
+    """Parse the raw ordered cross-model fallback chain — SSOT for every consumer
+    (resilience walk, pricing categorization, credentialed-model resolution).
+
+    Reads OUROBOROS_MODEL_FALLBACKS, then the legacy singular OUROBOROS_MODEL_FALLBACK
+    (env-only back-compat). No dedup, no active-model drop, and NO SETTINGS_DEFAULTS
+    injection: an EXPLICITLY empty Fallbacks slot means "no cross-model fallback" (so an
+    OpenAI-compatible / local owner who clears it is not silently routed to the default
+    Anthropic chain into an unconfigured provider). The shipped default reaches a default
+    install through apply_settings_to_env, which writes the non-empty default into env."""
+    raw = (
+        str(os.environ.get("OUROBOROS_MODEL_FALLBACKS", "") or "").strip()
+        or str(os.environ.get("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
+    )
+    return [m.strip() for m in _parse_model_list(raw) if str(m or "").strip()]
+
+
+def get_fallback_models(active_model: str = "") -> list[str]:
+    """Return the ordered cross-model resilience CHAIN (deduped, with the active model
+    removed so a benchmark all-slots-one-model setup collapses the chain to a no-op)."""
+    out: list[str] = []
+    seen = set()
+    active = str(active_model or "").strip()
+    for m in parse_fallback_chain():
+        if m and m != active and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+# v6.39 slot rename-alias migration (same shape as the retention-key rename):
+# OUROBOROS_MODEL_CODE -> _HEAVY, USE_LOCAL_CODE -> USE_LOCAL_HEAVY,
+# OUROBOROS_MODEL_FALLBACK -> _FALLBACKS.
+_LEGACY_SLOT_RENAMES = (
+    ("OUROBOROS_MODEL_CODE", "OUROBOROS_MODEL_HEAVY"),
+    ("OUROBOROS_VISION_MODEL", "OUROBOROS_MODEL_VISION"),
+    ("USE_LOCAL_CODE", "USE_LOCAL_HEAVY"),
+    ("OUROBOROS_MODEL_FALLBACK", "OUROBOROS_MODEL_FALLBACKS"),
+)
+
+
+def migrate_legacy_slot_keys(settings: dict) -> dict:
+    """In-place v6.39 slot rename-alias migration. Preserves a stored value (never orphans
+    an owner customization), then drops the legacy key so it does not linger. Shared SSOT
+    for every settings entry point (load_settings AND the Colab settings builder) so a
+    Drive/legacy settings file is migrated the same way regardless of how it is loaded."""
+    for _old, _new in _LEGACY_SLOT_RENAMES:
+        if _new not in settings and _old in settings:
+            settings[_new] = settings[_old]
+        settings.pop(_old, None)
+    return settings
 
 
 def get_consciousness_model() -> str:
@@ -456,6 +591,32 @@ def get_max_workers() -> int:
     return max(1, parsed)
 
 
+def get_task_idle_timeout_sec() -> int:
+    """Idle window before a task is eligible for an activity-based stop: it has made
+    no REAL progress (its own last_progress_at) AND has no progressing subtree for
+    this long. The periodic 30s process heartbeat is liveness, NOT progress."""
+    raw = os.environ.get(
+        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", SETTINGS_DEFAULTS["OUROBOROS_TASK_IDLE_TIMEOUT_SEC"]
+    )
+    try:
+        return max(60, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_TASK_IDLE_TIMEOUT_SEC"])
+
+
+def get_task_abs_ceiling_sec() -> int:
+    """Absolute wall-clock backstop per task, independent of activity — the only hard
+    time axis (budget/cost is the other, separate hard axis). A productively-waiting
+    orchestrator survives to this ceiling instead of a flat 1800s wall-clock kill."""
+    raw = os.environ.get(
+        "OUROBOROS_TASK_ABS_CEILING_SEC", SETTINGS_DEFAULTS["OUROBOROS_TASK_ABS_CEILING_SEC"]
+    )
+    try:
+        return max(300, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_TASK_ABS_CEILING_SEC"])
+
+
 def get_per_call_timeout_ceiling_sec() -> int:
     """SSOT ceiling for an explicit per-call run_command/run_script timeout_sec
     (and the outer tool-execution cap that accommodates it)."""
@@ -635,6 +796,30 @@ def get_subagent_projects_root() -> str:
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROJECTS_ROOT", "")
     ).strip()
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "projects"))
+
+
+def get_search_code_wall_sec() -> float:
+    """Total wall-clock budget (seconds) for ONE search_code call — bounds both the rg
+    directory walk and the batched rg loop so a scan over a very large root cannot run
+    unbounded. Env/setting: ``OUROBOROS_SEARCH_CODE_WALL_SEC`` (floored at 5s)."""
+    raw = (os.environ.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "")
+           or str(SETTINGS_DEFAULTS.get("OUROBOROS_SEARCH_CODE_WALL_SEC", "45")))
+    try:
+        return max(5.0, float(raw))
+    except (TypeError, ValueError):
+        return 45.0
+
+
+def get_deliverables_root() -> str:
+    """Visible container for UNNAMED user deliverables: a bare filename (no directory) lands here
+    instead of cluttering the home root. Sibling of the genesis projects root under ~/Ouroboros,
+    outside data/, and never GC-pruned. An explicit placement (Desktop/..., Downloads/..., or any
+    path WITH a directory) is always honored as given. Override with OUROBOROS_DELIVERABLES_ROOT."""
+    raw = str(
+        os.environ.get("OUROBOROS_DELIVERABLES_ROOT", "")
+        or SETTINGS_DEFAULTS.get("OUROBOROS_DELIVERABLES_ROOT", "")
+    ).strip()
+    return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "Deliverables"))
 
 
 def get_task_review_mode() -> str:
@@ -937,6 +1122,7 @@ def load_settings() -> dict:
                 loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
         for _legacy in LEGACY_RETENTION_KEYS:
             loaded.pop(_legacy, None)
+        migrate_legacy_slot_keys(loaded)
         settings = dict(SETTINGS_DEFAULTS)
         settings.update(loaded)
         for key in SETTINGS_DEFAULTS:
@@ -1044,6 +1230,14 @@ def get_mcp_tool_timeout_sec() -> int:
     return parsed if parsed > 0 else int(SETTINGS_DEFAULTS["MCP_TOOL_TIMEOUT_SEC"])
 
 
+def get_vision_caption_timeout_sec() -> int:
+    raw = os.environ.get("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", SETTINGS_DEFAULTS["OUROBOROS_VISION_CAPTION_TIMEOUT_SEC"])
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return int(SETTINGS_DEFAULTS["OUROBOROS_VISION_CAPTION_TIMEOUT_SEC"])
+
+
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
     raw = os.environ.get("OUROBOROS_FINALIZATION_GRACE_SEC")
     if raw is None and isinstance(settings, dict):
@@ -1114,19 +1308,30 @@ def apply_settings_to_env(settings: dict) -> None:
         "GIGACHAT_PROFANITY_CHECK",
         "ANTHROPIC_API_KEY",
         "OUROBOROS_NETWORK_PASSWORD",
-        "OUROBOROS_MODEL", "OUROBOROS_MODEL_CODE", "OUROBOROS_MODEL_LIGHT",
+        "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION",
         "OUROBOROS_MODEL_CONSCIOUSNESS",
-        "OUROBOROS_MODEL_FALLBACK", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "OUROBOROS_FALLBACK_COOLDOWN_SEC",
+        "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_MODEL_MAX_CONCURRENCY",
+        "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC",
+        "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC",
+        "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
         "OUROBOROS_MAX_WORKERS", "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT",
         "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
         "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO",
+        "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
         "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC",
+        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC",
         "OUROBOROS_MAX_ROUNDS", "OUROBOROS_TRANSIENT_RETRY_MAX",
+        "OUROBOROS_IMAGE_INPUT_MODE",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
-        "OUROBOROS_WEBSEARCH_MODEL",
+        "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_WEBSEARCH_BACKEND", "OUROBOROS_OR_PROVIDER",
+        "OUROBOROS_SEARCH_CODE_WALL_SEC",
+        "OUROBOROS_GENERATIVE_PROBE", "OUROBOROS_GENERATIVE_PROBE_CHARS",
         "OUROBOROS_POST_TASK_EVOLUTION", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE",
         "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE",
         "OUROBOROS_REVIEW_MODELS", "OUROBOROS_REVIEW_ENFORCEMENT",
@@ -1144,6 +1349,7 @@ def apply_settings_to_env(settings: dict) -> None:
         # Acting (mutative) subagents: owner toggle + worktree/projects roots.
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "OUROBOROS_SUBAGENT_WORKTREE_ROOT",
         "OUROBOROS_SUBAGENT_PROJECTS_ROOT",
+        "OUROBOROS_DELIVERABLES_ROOT",
         # ClawHub marketplace registry URL.
         "OUROBOROS_CLAWHUB_REGISTRY_URL",
         "MCP_ENABLED", "MCP_TOOL_TIMEOUT_SEC",
@@ -1152,10 +1358,11 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
         "OUROBOROS_EFFORT_CONSCIOUSNESS",
         "OUROBOROS_RETURN_REASONING",
+        "OUROBOROS_REASONING_SUMMARY",
         "LOCAL_MODEL_SOURCE", "LOCAL_MODEL_FILENAME",
         "LOCAL_MODEL_PORT", "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH",
         "LOCAL_MODEL_CHAT_FORMAT",
-        "USE_LOCAL_MAIN", "USE_LOCAL_CODE", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
+        "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
         "OUROBOROS_FILE_BROWSER_DEFAULT",
     ]
     for k in env_keys:
