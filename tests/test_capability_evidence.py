@@ -188,6 +188,31 @@ def test_provider_metadata_window_routes_openai_compatible(monkeypatch):
     assert ce._provider_metadata_window("gigachat", "GigaChat", "", allow_fetch=True) == 0
 
 
+def test_probe_threads_api_key_through_metadata_and_generative(tmp_path, monkeypatch):
+    """First-run onboarding passes the in-flight OPENAI_COMPATIBLE_API_KEY to
+    probe(api_key=...) because it is not yet on disk. Confirm the key reaches BOTH
+    the metadata probe and (on fall-through) the generative probe for an
+    openai-compatible route."""
+    seen = {}
+
+    def _fake_meta(model, base_url, allow_fetch, api_key=None):
+        seen["meta_key"] = api_key
+        return 0  # force fall-through to the generative probe
+
+    def _fake_gen(provider, model, base_url="", api_key=None):
+        seen["gen_key"] = api_key
+        return 0, ce.STATUS_UNPROBEABLE, "stub"
+
+    monkeypatch.setattr(ce, "_openai_compatible_metadata_window", _fake_meta)
+    monkeypatch.setattr(ce, "_generative_probe_window", _fake_gen)
+    ce.probe(
+        tmp_path, provider="openai-compatible", model="m", base_url="http://x/v1",
+        allow_fetch=True, allow_generative=True, force=True, api_key="THEKEY",
+    )
+    assert seen["meta_key"] == "THEKEY"
+    assert seen["gen_key"] == "THEKEY"
+
+
 # --- v6.46.0: generative context-window probe + cloudru base_url fix ---
 
 def test_classify_generative_probe_response_no_network():
